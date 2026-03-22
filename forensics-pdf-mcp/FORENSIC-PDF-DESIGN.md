@@ -8,31 +8,25 @@ An MCP (Model Context Protocol) server that processes PDF files through a vision
 
 `forensics-pdf-mcp` accepts a PDF file, detects whether it contains embedded images (i.e., is scanned rather than digitally generated), transcribes those images using the `llama3.2-vision:90b` model, embeds the extracted text invisibly back into the PDF as a searchable layer, and returns both the enriched PDF and a structured summary of the document's contents.
 
-The service runs as a Docker container on the DGX Spark alongside the existing Ollama stack. It exposes two transports:
-
-- **stdio over SSH** — for Claude Code integration
-- **HTTP/SSE** — for the Python MCP client over `http://dgx-spark-claude:FORENSICS_PDF_MCP_PORT`
-
-All HTTP access is authenticated using Elliptic Curve Digital Signature Algorithm (ECDSA). Private keys never traverse the network.
+The service runs as a Docker container on the DGX Spark alongside the existing Ollama stack. It exposes a single HTTP/SSE transport over `http://dgx-spark-claude:FORENSICS_PDF_MCP_PORT`. All requests are authenticated using Elliptic Curve Digital Signature Algorithm (ECDSA). Private keys never traverse the network.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────┐     ┌─────────────────────────────────┐
-│       Claude Code (local)        │     │    Python MCP Client (local)    │
-│                                  │     │    forensics_client.py          │
-│  ~/.claude/settings.json         │     │    private_key.pem (P-256)      │
-└─────────────┬────────────────────┘     └─────────────┬───────────────────┘
-              │ stdio over SSH                          │ HTTP/SSE
-              │ docker exec -i                          │ ECDSA-signed requests
-              ▼                                         ▼
+┌─────────────────────────────────┐
+│    Any MCP Client (remote)      │
+│    forensics_client.py          │
+│    private_key.pem (P-256)      │
+└─────────────┬───────────────────┘
+              │ HTTP/SSE
+              │ ECDSA-signed requests
+              ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    forensics-pdf-mcp container                          │
 │                                                                         │
-│   server.py          ← stdio MCP transport                              │
-│   http_server.py     ← FastAPI HTTP/SSE MCP transport + auth middleware │
+│   http_server.py     ← FastAPI HTTP/SSE MCP server + auth middleware   │
 │       │                                                                 │
 │   auth/                                                                 │
 │     ecc_auth.py      ← ECDSA signature verification                     │
@@ -63,8 +57,7 @@ forensics-pdf-mcp/
 ├── Dockerfile                   # Container image definition
 ├── requirements.txt             # Server Python dependencies
 │
-├── server.py                    # MCP stdio entrypoint (Claude Code)
-├── http_server.py               # FastAPI HTTP/SSE MCP server
+├── http_server.py               # FastAPI HTTP/SSE MCP server (sole entrypoint)
 ├── pdf_processor.py             # PDF processing pipeline
 ├── ollama_client.py             # Async Ollama API wrapper
 │
@@ -106,10 +99,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Create persistent directories
 RUN mkdir -p /workspace /data
 
-# Default: run the HTTP server (stdio entrypoint overridden by docker exec)
 ENTRYPOINT ["python3", "http_server.py"]
 ```
 
@@ -152,32 +143,7 @@ volumes:
 
 ---
 
-## Transport 1: stdio over SSH (Claude Code)
-
-Claude Code spawns an SSH process that execs into the running container and communicates via stdin/stdout using the MCP protocol.
-
-**Claude Code settings** (`~/.claude/settings.json`):
-
-```json
-{
-  "mcpServers": {
-    "forensics-pdf-mcp": {
-      "command": "ssh",
-      "args": [
-        "claude@dgx-spark-claude",
-        "docker", "exec", "-i", "forensics-pdf-mcp",
-        "python3", "server.py"
-      ]
-    }
-  }
-}
-```
-
-`server.py` reads from stdin and writes to stdout using the MCP Python SDK's stdio transport. No authentication is applied on the stdio path — access is gated by SSH key authorization.
-
----
-
-## Transport 2: HTTP/SSE (Python Client)
+## Transport: HTTP/SSE
 
 `http_server.py` runs a FastAPI application that serves the MCP protocol over HTTP with Server-Sent Events. The server listens on `0.0.0.0:18790` (configurable via `HTTP_PORT`).
 
@@ -384,7 +350,7 @@ cryptography>=42.0
 
 ## MCP Tool: `process_pdf`
 
-Both the stdio and HTTP transports expose the same single tool.
+The server exposes a single tool.
 
 **Inputs** (one file source required):
 
@@ -605,7 +571,6 @@ Both are already pulled in the local Ollama instance. No internet required at ru
 | Private key storage | Stored only on the client machine at `~/.forensics-pdf-mcp/private_key.pem` (chmod 600). Never sent to the server. |
 | Key transport | Public keys are registered out-of-band via `docker exec` (requires SSH access to DGX). |
 | Network exposure | HTTP port (18790) is on the LAN only. Not routed through ExpressVPN. Not exposed to the internet by the existing stack. |
-| stdio path | Gated by SSH key authorization. No additional auth layer needed. |
 | Financial data | All LLM inference is on-device. Extracted text and PDFs never leave the local network. |
 | Workspace files | `/tmp/forensics-pdf-mcp` on host — cleared on reboot. The `forensics-pdf-keys` volume persists key registrations across container restarts. |
 | Key revocation | Set `active = 0` in SQLite immediately stops accepting requests from that key without container restart. |
