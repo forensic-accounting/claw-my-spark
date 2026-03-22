@@ -106,6 +106,35 @@ services:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
+  # forensics-pdf-mcp — PDF OCR / forensics MCP server
+  # Authenticated via ECDSA P-256 request signing (no API keys over the wire).
+  # Reaches Ollama directly via host network (llama3.2-vision:90b + qwen3:32b).
+  # Client connects to http://dgx-spark-claude:${FORENSICS_PDF_MCP_PORT:-18790}
+  # ---------------------------------------------------------------------------
+  forensics-pdf-mcp:
+    build:
+      context: ./forensics-pdf-mcp
+      dockerfile: Dockerfile
+    container_name: forensics-pdf-mcp
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /tmp/forensics-pdf-mcp:/workspace
+      - forensics-pdf-keys:/data
+    environment:
+      OLLAMA_BASE_URL: "http://localhost:11434"
+      VISION_MODEL: "llama3.2-vision:90b"
+      SUMMARY_MODEL: "qwen3:32b"
+      WORKSPACE_DIR: "/workspace"
+      DB_PATH: "/data/keys.db"
+      HTTP_PORT: "${FORENSICS_PDF_MCP_PORT:-18790}"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    stdin_open: true
+    tty: false
+
+  # ---------------------------------------------------------------------------
   # Caddy — HTTPS reverse proxy
   # Proxies to expressvpn:18789 (which forwards to openclaw via shared network).
   # ---------------------------------------------------------------------------
@@ -142,3 +171,6 @@ volumes:
 
   caddy-config:
     name: caddy-config
+
+  forensics-pdf-keys:
+    name: forensics-pdf-keys
