@@ -1,0 +1,144 @@
+# =============================================================================
+# docker-compose.yaml — Ollama + OpenClaw (DGX Spark, Ollama-only)
+#
+# Services
+#   ollama      — GPU-accelerated Ollama inference server
+#   expressvpn  — OpenVPN sidecar; all openclaw internet traffic routes through it
+#   openclaw    — OpenClaw agent gateway (shares expressvpn network namespace)
+#   caddy       — HTTPS reverse proxy (local CA, ports 80/443)
+#
+# Usage
+#   docker compose up -d --build
+#
+# To change the default model or context length, edit .env.
+# To reconfigure OpenClaw, edit openclaw/openclaw.json and restart:
+#   docker compose restart openclaw expressvpn
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Ollama — local LLM inference server
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: always
+    ports:
+      - "${OLLAMA_HOST_PORT:-11434}:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-65536}"
+      OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-24h}"
+      OLLAMA_HOST: "0.0.0.0"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    healthcheck:
+      test: [ "CMD", "ollama", "list" ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # ExpressVPN — OpenVPN sidecar
+  # All outbound internet traffic from openclaw is tunnelled through ExpressVPN.
+  # openclaw shares this container's network namespace via network_mode below.
+  # Port 18789 is exposed here on behalf of openclaw.
+  # Requires NET_ADMIN capability and /dev/net/tun device.
+  # ---------------------------------------------------------------------------
+  expressvpn:
+    build:
+      context: ./expressvpn
+      dockerfile: Dockerfile
+    container_name: expressvpn
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    ports:
+      - "${OPENCLAW_PORT:-18789}:18789"
+    environment:
+      EXPRESS_VPN_OPENVPN_USERNAME: "${EXPRESS_VPN_OPENVPN_USERNAME}"
+      EXPRESS_VPN_OPENVPN_PASSWORD: "${EXPRESS_VPN_OPENVPN_PASSWORD}"
+      EXPRESS_VPN_CONFIG: "${EXPRESS_VPN_CONFIG}"
+    healthcheck:
+      test: [ "CMD-SHELL", "ip route show 0.0.0.0/1 | grep -q tun" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # OpenClaw — agent gateway (local build)
+  # Shares the expressvpn network namespace so all its internet traffic is
+  # tunnelled. Still reaches ollama via Docker bridge (route preserved by
+  # expressvpn/entrypoint.sh). Port 18789 is owned by the expressvpn service.
+  # ---------------------------------------------------------------------------
+  openclaw:
+    build:
+      context: ./openclaw
+      dockerfile: Dockerfile
+    container_name: openclaw
+    restart: always
+    network_mode: "service:expressvpn"
+    volumes:
+      - ./openclaw/openclaw.json:/config/openclaw.json:ro
+      - openclaw-config:/root/.openclaw
+      - openclaw-workspace:/root/openclaw/workspace
+    environment:
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      DEFAULT_MODEL: "${DEFAULT_MODEL:-qwen3:14b}"
+      PULL_DEFAULT_MODEL: "${PULL_DEFAULT_MODEL:-true}"
+    depends_on:
+      expressvpn:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Caddy — HTTPS reverse proxy
+  # Proxies to expressvpn:18789 (which forwards to openclaw via shared network).
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:latest
+    container_name: caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./openclaw/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - expressvpn
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  ollama-models:
+    name: ollama
+    external: true
+
+  openclaw-config:
+    name: openclaw-config
+
+  openclaw-workspace:
+    name: openclaw-workspace
+
+  caddy-data:
+    name: caddy-data
+
+  caddy-config:
+    name: caddy-config

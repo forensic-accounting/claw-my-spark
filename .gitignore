@@ -1,0 +1,13 @@
+# Environment — contains secrets, never commit
+.env
+
+openclaw/openclaw.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
