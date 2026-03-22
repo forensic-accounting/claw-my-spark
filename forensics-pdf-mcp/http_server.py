@@ -103,7 +103,11 @@ async def process_pdf(
 
 
 # --- FastAPI app ---
-app = FastAPI(title="forensics-pdf-mcp")
+# Capture the mcp ASGI app first so we can pass its lifespan to FastAPI.
+# FastMCP's StreamableHTTPSessionManager requires the lifespan to run its
+# internal task group; without it every request gets a 500.
+mcp_app = mcp.http_app(path="/")
+app = FastAPI(title="forensics-pdf-mcp", lifespan=mcp_app.lifespan)
 
 # Add auth middleware first (becomes outermost wrapper due to LIFO)
 app.add_middleware(ECDSAAuthMiddleware, registry=registry)
@@ -115,7 +119,7 @@ async def health():
 
 
 # Mount FastMCP at /mcp — must happen after middleware is registered
-app.mount("/mcp", mcp.http_app(path="/"))
+app.mount("/mcp", mcp_app)
 
 
 if __name__ == "__main__":

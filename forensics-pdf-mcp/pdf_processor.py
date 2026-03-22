@@ -107,8 +107,8 @@ async def process_pdf_pipeline(
         try:
             summary = await generate_summary(full_text, summary_model, ollama_base_url)
         except Exception as exc:
-            logger.error("Summary generation failed: %s", exc)
-            summary = f"Summary generation failed: {exc}"
+            logger.error("Summary generation failed: %s: %s", type(exc).__name__, exc)
+            summary = f"Summary generation failed: {type(exc).__name__}: {exc}"
     else:
         summary = "No extractable text content found in this document."
 

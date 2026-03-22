@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _VISION_SEMAPHORE = asyncio.Semaphore(3)
 
 VISION_TIMEOUT = 180.0   # seconds — 90b model can take 30–90s per page
-SUMMARY_TIMEOUT = 120.0
+SUMMARY_TIMEOUT = 300.0
 
 VISION_PROMPT = (
     "You are a forensic document analyst and OCR assistant. "
@@ -39,6 +39,7 @@ VISION_PROMPT = (
 )
 
 SUMMARY_PROMPT = (
+    "/no_think\n"
     "You are a financial forensics analyst. The following is OCR-extracted "
     "text from a financial document. Produce a structured summary including:\n\n"
     "- Document type (bank statement, check, invoice, wire transfer, etc.)\n"

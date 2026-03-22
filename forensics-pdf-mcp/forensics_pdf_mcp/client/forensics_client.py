@@ -138,10 +138,12 @@ class ForensicsClient:
             base_url=self._server_url.rstrip("/"),
             timeout=timeout,
         )
+        self._session_id: Optional[str] = None
 
     # --- Context manager ---
 
     async def __aenter__(self) -> "ForensicsClient":
+        await self._initialize_session()
         return self
 
     async def __aexit__(self, *_) -> None:
@@ -178,6 +180,27 @@ class ForensicsClient:
 
     # --- Internal ---
 
+    async def _initialize_session(self) -> None:
+        """Send MCP initialize handshake and store the session ID."""
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "forensics-pdf-mcp-client", "version": "0.1.0"},
+            },
+        }).encode()
+        auth_headers = _sign_request(self._private_key_pem, self._key_id, payload)
+        auth_headers["Content-Type"] = "application/json"
+        auth_headers["Accept"] = "application/json, text/event-stream"
+        resp = await self._http.post("/mcp/", content=payload, headers=auth_headers)
+        resp.raise_for_status()
+        self._session_id = resp.headers.get("mcp-session-id")
+        # Consume the initialize result (required by some server implementations)
+        self._parse_mcp_response(resp)
+
     async def _call_tool(self, tool_name: str, arguments: dict) -> dict:
         payload = json.dumps({
             "jsonrpc": "2.0",
@@ -188,11 +211,14 @@ class ForensicsClient:
 
         auth_headers = _sign_request(self._private_key_pem, self._key_id, payload)
         auth_headers["Content-Type"] = "application/json"
+        auth_headers["Accept"] = "application/json, text/event-stream"
+        if self._session_id:
+            auth_headers["Mcp-Session-Id"] = self._session_id
 
         resp = await self._http.post("/mcp/", content=payload, headers=auth_headers)
         resp.raise_for_status()
 
-        data = resp.json()
+        data = self._parse_mcp_response(resp)
         if "error" in data:
             raise RuntimeError(f"MCP error: {data['error']}")
 
@@ -201,6 +227,18 @@ class ForensicsClient:
         if content and content[0].get("type") == "text":
             return json.loads(content[0]["text"])
         raise RuntimeError(f"Unexpected MCP response structure: {data}")
+
+    @staticmethod
+    def _parse_mcp_response(resp: httpx.Response) -> dict:
+        """Parse a JSON or SSE response from the MCP server."""
+        ct = resp.headers.get("content-type", "")
+        if "text/event-stream" in ct:
+            # Extract JSON from the first `data:` line in the SSE stream
+            for line in resp.text.splitlines():
+                if line.startswith("data:"):
+                    return json.loads(line[len("data:"):].strip())
+            raise RuntimeError(f"No data line in SSE response: {resp.text[:200]}")
+        return resp.json()
 
     @staticmethod
     def _read_file(path: pathlib.Path) -> Optional[str]:

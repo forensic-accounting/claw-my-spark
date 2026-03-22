@@ -5,6 +5,18 @@ openclaw/openclaw.json
 
 expressvpn/configs/*
 
+# Python virtual environment
+venv/*
+
+# Some system tests
+tests/
+
+# Ingnore test PDF files
+*.pdf
+
+**/__pycache__/
+**/*.egg-info/
+
 # OS
 .DS_Store
 Thumbs.db

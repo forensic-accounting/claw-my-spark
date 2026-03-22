@@ -32,6 +32,9 @@ services:
       OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-65536}"
       OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-24h}"
       OLLAMA_HOST: "0.0.0.0"
+    devices:
+      - /dev/nvidia-caps/nvidia-cap1:/dev/nvidia-caps/nvidia-cap1
+      - /dev/nvidia-caps/nvidia-cap2:/dev/nvidia-caps/nvidia-cap2
     deploy:
       resources:
         reservations:
