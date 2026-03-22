@@ -8,42 +8,50 @@ An MCP (Model Context Protocol) server that processes PDF files through a vision
 
 `forensics-pdf-mcp` accepts a PDF file, detects whether it contains embedded images (i.e., is scanned rather than digitally generated), transcribes those images using the `llama3.2-vision:90b` model, embeds the extracted text invisibly back into the PDF as a searchable layer, and returns both the enriched PDF and a structured summary of the document's contents.
 
-The entire service runs as a Docker container on the DGX Spark alongside the existing Ollama stack. It communicates with Claude Code via the MCP stdio transport tunneled over SSH.
+The service runs as a Docker container on the DGX Spark alongside the existing Ollama stack. It exposes two transports:
+
+- **stdio over SSH** — for Claude Code integration
+- **HTTP/SSE** — for the Python MCP client over `http://dgx-spark-claude:FORENSICS_PDF_MCP_PORT`
+
+All HTTP access is authenticated using Elliptic Curve Digital Signature Algorithm (ECDSA). Private keys never traverse the network.
 
 ---
 
 ## Architecture
 
 ```
-Claude Code (local)
-    │
-    │  MCP stdio over SSH
-    ▼
-ssh claude@dgx-spark-claude
-    │
-    │  docker exec / stdio
-    ▼
-┌─────────────────────────────────┐
-│   forensics-pdf-mcp container   │
-│                                 │
-│   server.py  (MCP stdio)        │
-│       │                         │
-│   pdf_processor.py              │
-│       │                         │
-│   ollama_client.py              │
-│       │                         │
-└───────┼─────────────────────────┘
-        │  HTTP  (host network)
-        ▼
-┌───────────────────┐
-│  ollama container │
-│  llama3.2-vision  │
-│  :90b / :11b      │
-│  qwen3:32b        │
-└───────────────────┘
+┌──────────────────────────────────┐     ┌─────────────────────────────────┐
+│       Claude Code (local)        │     │    Python MCP Client (local)    │
+│                                  │     │    forensics_client.py          │
+│  ~/.claude/settings.json         │     │    private_key.pem (P-256)      │
+└─────────────┬────────────────────┘     └─────────────┬───────────────────┘
+              │ stdio over SSH                          │ HTTP/SSE
+              │ docker exec -i                          │ ECDSA-signed requests
+              ▼                                         ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    forensics-pdf-mcp container                          │
+│                                                                         │
+│   server.py          ← stdio MCP transport                              │
+│   http_server.py     ← FastAPI HTTP/SSE MCP transport + auth middleware │
+│       │                                                                 │
+│   auth/                                                                 │
+│     ecc_auth.py      ← ECDSA signature verification                     │
+│     key_registry.py  ← SQLite public key store + nonce replay defense  │
+│       │                                                                 │
+│   pdf_processor.py   ← PDF pipeline orchestration                      │
+│   ollama_client.py   ← Async Ollama API wrapper                        │
+│                                                                         │
+│   /data/keys.db      ← SQLite (persisted via Docker volume)            │
+│   /workspace/        ← PDF working directory (Docker volume)           │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │ HTTP (host network)
+                                ▼
+                   ┌────────────────────────┐
+                   │    ollama container    │
+                   │   llama3.2-vision:90b  │
+                   │   qwen3:32b            │
+                   └────────────────────────┘
 ```
-
-The container runs on the Docker host network so it can reach Ollama at `http://localhost:11434` without any additional networking configuration.
 
 ---
 
@@ -51,13 +59,28 @@ The container runs on the Docker host network so it can reach Ollama at `http://
 
 ```
 forensics-pdf-mcp/
-├── DESIGN.md                  # This document
-├── Dockerfile                 # Container image definition
-├── docker-compose.yaml        # Service definition (integrates with existing stack)
-├── requirements.txt           # Python dependencies
-├── server.py                  # MCP server entrypoint (stdio transport)
-├── pdf_processor.py           # Core PDF processing pipeline
-└── ollama_client.py           # Async Ollama API wrapper
+├── FORENSIC-PDF-DESIGN.md       # This document
+├── Dockerfile                   # Container image definition
+├── requirements.txt             # Server Python dependencies
+│
+├── server.py                    # MCP stdio entrypoint (Claude Code)
+├── http_server.py               # FastAPI HTTP/SSE MCP server
+├── pdf_processor.py             # PDF processing pipeline
+├── ollama_client.py             # Async Ollama API wrapper
+│
+├── auth/
+│   ├── __init__.py
+│   ├── ecc_auth.py              # ECDSA signature verification middleware
+│   ├── key_registry.py          # SQLite key store (public keys + nonces)
+│   └── schema.sql               # Database schema
+│
+├── admin/
+│   ├── keygen.py                # Generate a client EC keypair
+│   └── register_client.py       # Register a client public key with the server
+│
+└── client/
+    ├── requirements.txt         # Client-only Python dependencies
+    └── forensics_client.py      # Python MCP client library
 ```
 
 ---
@@ -66,9 +89,9 @@ forensics-pdf-mcp/
 
 ### Base Image
 
-`python:3.12-slim` — minimal footprint, matches the Python version already on the DGX Spark host.
+`python:3.12-slim` — minimal footprint, matches the host Python version.
 
-### Build
+### Dockerfile
 
 ```dockerfile
 FROM python:3.12-slim
@@ -83,21 +106,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENTRYPOINT ["python3", "server.py"]
+# Create persistent directories
+RUN mkdir -p /workspace /data
+
+# Default: run the HTTP server (stdio entrypoint overridden by docker exec)
+ENTRYPOINT ["python3", "http_server.py"]
 ```
 
-### Runtime
-
-| Setting | Value |
-|---|---|
-| Network mode | `host` |
-| Restart policy | `unless-stopped` |
-| Volumes | `/tmp/forensics-pdf-mcp` mounted at `/workspace` for temp file I/O |
-| Environment | `OLLAMA_BASE_URL=http://localhost:11434` |
-
-### docker-compose.yaml (addition to existing stack)
-
-The service is added as a new entry in the existing `docker-compose.yaml` so it shares the same lifecycle as Ollama:
+### docker-compose.yaml Addition
 
 ```yaml
 forensics-pdf-mcp:
@@ -107,13 +123,18 @@ forensics-pdf-mcp:
   container_name: forensics-pdf-mcp
   restart: unless-stopped
   network_mode: host
+  ports:
+    - "${FORENSICS_PDF_MCP_PORT:-18790}:18790"
   volumes:
     - /tmp/forensics-pdf-mcp:/workspace
+    - forensics-pdf-keys:/data
   environment:
-    OLLAMA_BASE_URL: "http://localhost:11434"
-    VISION_MODEL: "llama3.2-vision:90b"
-    SUMMARY_MODEL: "qwen3:32b"
-    WORKSPACE_DIR: "/workspace"
+    OLLAMA_BASE_URL:   "http://localhost:11434"
+    VISION_MODEL:      "llama3.2-vision:90b"
+    SUMMARY_MODEL:     "qwen3:32b"
+    WORKSPACE_DIR:     "/workspace"
+    DB_PATH:           "/data/keys.db"
+    HTTP_PORT:         "${FORENSICS_PDF_MCP_PORT:-18790}"
   depends_on:
     ollama:
       condition: service_healthy
@@ -121,15 +142,21 @@ forensics-pdf-mcp:
   tty: false
 ```
 
-`stdin_open: true` keeps the container alive waiting for MCP stdio connections. Claude Code connects by running `docker exec -i forensics-pdf-mcp python3 server.py` via SSH.
+Add the volume to the top-level `volumes:` block:
+
+```yaml
+volumes:
+  forensics-pdf-keys:
+    name: forensics-pdf-keys
+```
 
 ---
 
-## MCP Interface
+## Transport 1: stdio over SSH (Claude Code)
 
-### Transport
+Claude Code spawns an SSH process that execs into the running container and communicates via stdin/stdout using the MCP protocol.
 
-stdio, tunneled through SSH:
+**Claude Code settings** (`~/.claude/settings.json`):
 
 ```json
 {
@@ -146,28 +173,237 @@ stdio, tunneled through SSH:
 }
 ```
 
-### Tool: `process_pdf`
+`server.py` reads from stdin and writes to stdout using the MCP Python SDK's stdio transport. No authentication is applied on the stdio path — access is gated by SSH key authorization.
 
-The server exposes a single tool.
+---
 
-**Inputs** (one of the two file inputs is required):
+## Transport 2: HTTP/SSE (Python Client)
+
+`http_server.py` runs a FastAPI application that serves the MCP protocol over HTTP with Server-Sent Events. The server listens on `0.0.0.0:18790` (configurable via `HTTP_PORT`).
+
+### MCP over HTTP/SSE
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/mcp/sse` | GET | SSE stream — server pushes MCP messages to client |
+| `/mcp/messages` | POST | Client sends MCP messages (tool calls, etc.) |
+| `/health` | GET | Unauthenticated health check |
+
+All `/mcp/*` endpoints require a valid ECDSA authentication header set (see Authentication section below).
+
+---
+
+## Authentication: ECDSA Request Signing
+
+### Design Principles
+
+- The API key **never appears on the network** — only a signature over request metadata does.
+- Each client has a unique P-256 EC private key stored locally.
+- The server stores only the corresponding public keys in SQLite.
+- Every HTTP request is signed. Replayed or tampered requests are rejected.
+
+### Elliptic Curve Parameters
+
+| Parameter | Value |
+|---|---|
+| Curve | P-256 (secp256r1, NIST) |
+| Hash | SHA-256 |
+| Signature scheme | ECDSA |
+| Key format | PEM (PKCS#8 private, SubjectPublicKeyInfo public) |
+
+P-256 is the standard choice for modern ECDSA: widely supported, 128-bit security level, compact signatures (~71 bytes DER-encoded).
+
+### SQLite Schema (`auth/schema.sql`)
+
+```sql
+-- Registered client public keys
+CREATE TABLE IF NOT EXISTS keys (
+    key_id      TEXT PRIMARY KEY,          -- UUID v4, identifies the client
+    client_name TEXT NOT NULL,             -- human-readable label
+    public_key  TEXT NOT NULL,             -- PEM-encoded SubjectPublicKeyInfo
+    created_at  TEXT NOT NULL,             -- ISO-8601 UTC
+    active      INTEGER NOT NULL DEFAULT 1 -- 0 = revoked
+);
+
+-- Seen nonces — prevents replay attacks
+-- Rows older than 5 minutes are pruned on each request
+CREATE TABLE IF NOT EXISTS nonces (
+    nonce      TEXT PRIMARY KEY,           -- UUID v4, single-use
+    key_id     TEXT NOT NULL,
+    used_at    TEXT NOT NULL               -- ISO-8601 UTC
+);
+
+CREATE INDEX IF NOT EXISTS idx_nonces_used_at ON nonces(used_at);
+```
+
+### Per-Request Signing Protocol
+
+#### Client side (`auth/ecc_auth.py` — signing half)
+
+1. Compute `body_hash = SHA-256(raw request body bytes).hex()`
+2. Assemble the canonical string (newline-separated, no trailing newline):
+   ```
+   <key_id>
+   <timestamp>        ← ISO-8601 UTC, e.g. 2026-03-22T14:05:00.123456Z
+   <nonce>            ← fresh UUID v4
+   <body_hash>
+   ```
+3. Sign the UTF-8 encoding of the canonical string with ECDSA + SHA-256:
+   ```python
+   signature_der = private_key.sign(canonical_bytes, ec.ECDSA(hashes.SHA256()))
+   signature_b64 = base64.urlsafe_b64encode(signature_der).decode()
+   ```
+4. Attach headers to the HTTP request:
+   ```
+   X-Auth-Key-ID:    <key_id>
+   X-Auth-Timestamp: <timestamp>
+   X-Auth-Nonce:     <nonce>
+   X-Auth-Signature: <signature_b64>
+   ```
+
+#### Server side (`auth/ecc_auth.py` — verification half)
+
+1. Extract the four `X-Auth-*` headers. Return `401` if any are missing.
+2. Parse timestamp; reject if `|now - timestamp| > 60 seconds`. Return `401`.
+3. Look up `key_id` in SQLite `keys` table. Return `401` if not found or inactive.
+4. Check `nonce` is not in the `nonces` table. Return `401` if already seen (replay).
+5. Read raw request body bytes; compute `body_hash = SHA-256(body).hex()`.
+6. Reconstruct the canonical string identically to the client.
+7. Verify ECDSA signature using the stored public key:
+   ```python
+   public_key.verify(signature_der, canonical_bytes, ec.ECDSA(hashes.SHA256()))
+   ```
+   Return `401` if verification raises `InvalidSignature`.
+8. Insert nonce into SQLite with current timestamp. Prune nonces older than 5 minutes.
+9. Allow request to proceed.
+
+### Security Properties
+
+| Threat | Defense |
+|---|---|
+| API key interception | Private key never sent; only a signature of the request is transmitted |
+| Request replay | Per-request UUID nonce stored in SQLite; rejected on second use |
+| Request tampering | Body hash is part of the signed canonical string; any modification invalidates the signature |
+| Timestamp forgery | Server enforces ±60s window; clocks must be roughly synchronized |
+| Key compromise | Admin can set `active = 0` in SQLite to revoke a key instantly |
+| Brute-force key recovery | Computationally infeasible against P-256 |
+
+---
+
+## Key Management
+
+### Generating a Client Keypair (`admin/keygen.py`)
+
+Run once per client machine. Outputs two PEM files.
+
+```bash
+# On the client machine
+python3 admin/keygen.py --client-name "my-workstation" --output-dir ~/.forensics-pdf-mcp/
+```
+
+Produces:
+- `~/.forensics-pdf-mcp/private_key.pem` — EC private key (chmod 600)
+- `~/.forensics-pdf-mcp/public_key.pem` — public key to register with the server
+- `~/.forensics-pdf-mcp/key_id.txt` — the UUID assigned to this keypair
+
+### Registering a Public Key (`admin/register_client.py`)
+
+Run inside the container (or via `docker exec`) to add a client's public key to the server's database.
+
+```bash
+# On the DGX Spark
+docker exec -i forensics-pdf-mcp python3 admin/register_client.py \
+    --key-id "$(cat ~/.forensics-pdf-mcp/key_id.txt)" \
+    --client-name "my-workstation" \
+    --public-key-file /path/to/public_key.pem
+```
+
+### Revoking a Key
+
+```bash
+docker exec -i forensics-pdf-mcp python3 -c \
+  "from auth.key_registry import KeyRegistry; KeyRegistry('/data/keys.db').revoke('<key_id>')"
+```
+
+---
+
+## Python MCP Client (`client/forensics_client.py`)
+
+A self-contained Python library that any script or application can import to submit PDFs to the forensics pipeline.
+
+### Client Configuration
+
+The client reads from `~/.forensics-pdf-mcp/config.json` by default:
+
+```json
+{
+  "server_url": "http://dgx-spark-claude:18790",
+  "key_id_file": "~/.forensics-pdf-mcp/key_id.txt",
+  "private_key_file": "~/.forensics-pdf-mcp/private_key.pem"
+}
+```
+
+All fields can be overridden programmatically or via environment variables (`FORENSICS_SERVER_URL`, `FORENSICS_KEY_ID_FILE`, `FORENSICS_PRIVATE_KEY_FILE`).
+
+### Client API
+
+```python
+from client.forensics_client import ForensicsClient, ProcessResult
+
+async with ForensicsClient() as client:
+
+    # Submit a local PDF file
+    result: ProcessResult = await client.process_pdf_file("/path/to/statement.pdf")
+
+    # Or submit raw bytes
+    result: ProcessResult = await client.process_pdf_bytes(pdf_bytes, filename="invoice.pdf")
+
+    print(result.summary)
+    result.save_enriched("/path/to/statement_ocr.pdf")
+```
+
+### `ProcessResult` Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `summary` | `str` | Structured forensics summary from qwen3:32b |
+| `enriched_pdf` | `bytes` | PDF with invisible OCR text layer embedded |
+| `had_embedded_images` | `bool` | Whether image-based pages were found |
+| `pages_processed` | `int` | Total pages in document |
+| `images_transcribed` | `int` | Pages processed through vision model |
+| `save_enriched(path)` | method | Writes `enriched_pdf` to disk |
+
+### Client Dependencies (`client/requirements.txt`)
+
+```
+httpx>=0.27
+cryptography>=42.0
+```
+
+---
+
+## MCP Tool: `process_pdf`
+
+Both the stdio and HTTP transports expose the same single tool.
+
+**Inputs** (one file source required):
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `file_path` | string | one of | Absolute path to a PDF file accessible inside the container's `/workspace` volume |
-| `file_base64` | string | one of | Base64-encoded PDF file content |
-| `filename` | string | when using `file_base64` | Original filename, used for naming the output file |
+| `file_path` | string | one of | Absolute path to PDF inside `/workspace` |
+| `file_base64` | string | one of | Base64-encoded PDF content |
+| `filename` | string | with `file_base64` | Original filename for output naming |
 
 **Outputs:**
 
 | Field | Type | Description |
 |---|---|---|
-| `summary` | string | Structured narrative summary of the document |
-| `enriched_pdf_base64` | string | Base64-encoded PDF with invisible OCR text layer embedded |
-| `enriched_pdf_path` | string | Path inside `/workspace` where the enriched PDF was saved |
-| `had_embedded_images` | bool | Whether the PDF contained image-based pages |
-| `pages_processed` | int | Total number of pages in the document |
-| `images_transcribed` | int | Number of pages processed through the vision model |
+| `summary` | string | Structured narrative summary |
+| `enriched_pdf_base64` | string | Base64-encoded enriched PDF |
+| `enriched_pdf_path` | string | Path inside `/workspace` where enriched PDF was saved |
+| `had_embedded_images` | bool | Whether image-based pages were detected |
+| `pages_processed` | int | Total page count |
+| `images_transcribed` | int | Pages sent through the vision model |
 
 ---
 
@@ -177,46 +413,40 @@ The server exposes a single tool.
 
 Open the PDF with PyMuPDF (`fitz`). For each page:
 
-1. Call `page.get_images(full=True)` — returns all image XREFs embedded on the page.
-2. Attempt `page.get_text()` — if this returns empty or near-empty text alongside present images, the page is image-based.
-3. Build a per-page classification: `text_page`, `image_page`, or `mixed_page`.
+1. `page.get_images(full=True)` — detect embedded image XREFs.
+2. `page.get_text()` — if empty or near-empty alongside images, page is image-based.
+3. Classify each page: `text_page`, `image_page`, or `mixed_page`.
 
-A PDF is considered image-bearing if **any** page is classified as `image_page` or `mixed_page`.
+If the PDF has no image pages, skip Stages 2–4 and jump directly to Stage 5 (summary).
 
-If the PDF has no embedded images and has extractable text, the pipeline skips to Stage 4 (summary only).
+### Stage 2 — Page Rendering
 
-### Stage 2 — Image Extraction and Rendering
-
-Rather than extracting individual image XREFs (which may be partial regions or decorative elements), each image-bearing page is **rendered to a full-page PNG** using:
+Each image-bearing page is rendered to a full-page PNG (preserves spatial layout):
 
 ```python
-mat = fitz.Matrix(2.0, 2.0)   # 2x scale = ~144 DPI, sufficient for OCR
+mat = fitz.Matrix(2.0, 2.0)    # ~144 DPI
 pix = page.get_pixmap(matrix=mat)
 png_bytes = pix.tobytes("png")
 ```
 
-Rendering the full page preserves spatial relationships between text blocks, tables, and figures — which is critical for financial documents where column alignment and row context carry meaning.
+Full-page rendering is used instead of per-XREF extraction so that column alignment, table structure, and context between adjacent text and images is preserved.
 
-### Stage 3 — Vision Transcription
-
-For each rendered page image, an async HTTP POST is made to Ollama:
+### Stage 3 — Vision Transcription (`llama3.2-vision:90b`)
 
 ```
 POST http://localhost:11434/api/chat
 {
   "model": "llama3.2-vision:90b",
   "stream": false,
-  "messages": [
-    {
-      "role": "user",
-      "content": "<prompt>",
-      "images": ["<base64-encoded PNG>"]
-    }
-  ]
+  "messages": [{
+    "role": "user",
+    "content": "<see prompt below>",
+    "images": ["<base64 PNG>"]
+  }]
 }
 ```
 
-**Prompt**:
+**Prompt:**
 ```
 You are a forensic document analyst and OCR assistant. This image is a financial
 document — it may be a bank statement, cancelled check, wire transfer record, or
@@ -233,44 +463,40 @@ invoice. Your task:
 Return only the extracted text. No preamble or commentary.
 ```
 
-Pages are processed with a concurrency cap of **3 simultaneous vision requests** (asyncio semaphore) to avoid GPU memory contention on the 90b model.
-
-Per-page timeout: **180 seconds** (the 90b model on a GB10 takes 30–90s per page depending on density).
+- Concurrency cap: **3 simultaneous vision requests** (asyncio semaphore)
+- Per-page timeout: **180 seconds**
+- Fallback: if `llama3.2-vision:90b` is unavailable, retry with `llama3.2-vision:11b`
 
 ### Stage 4 — Invisible Text Embedding
 
-The original PDF is reopened in write mode. For each page that was transcribed:
+Using PyMuPDF's PDF invisible text rendering mode (TR3):
 
 ```python
 page.insert_text(
-    point=fitz.Point(0, page.rect.height),  # bottom-left anchor
+    point=fitz.Point(0, page.rect.height),
     text=extracted_text,
-    fontsize=1,                              # 1pt — effectively invisible
-    render_mode=3,                           # PDF invisible text mode (TR3)
+    fontsize=1,
+    render_mode=3,     # PDF spec TR3 — text present in stream, not painted
     color=(0, 0, 0),
 )
 ```
 
-`render_mode=3` is the PDF specification's "invisible text" rendering mode — the text is present in the content stream and fully selectable/searchable but not painted on screen. This is the same technique used by Tesseract, OCRmyPDF, and Adobe Acrobat's OCR feature.
+Output saved to `/workspace/<filename>_forensics.pdf`.
 
-The enriched PDF is saved to `/workspace/<original_filename>_forensics.pdf`.
+### Stage 5 — Summary Generation (`qwen3:32b`)
 
-### Stage 5 — Summary Generation
-
-All extracted text (plus any pre-existing extractable text from non-image pages) is concatenated and sent to `qwen3:32b` for a structured summary:
+All text (OCR-extracted + native) is sent to `qwen3:32b`:
 
 ```
-You are a financial forensics analyst. The following is OCR-extracted text from
-a financial document. Produce a structured summary including:
-
-- Document type (bank statement, check, invoice, wire transfer, etc.)
-- Issuing institution or vendor name
-- Account holder name(s) if present
-- Account or reference numbers (redact last 4 digits if a full number is shown)
+You are a financial forensics analyst. Produce a structured summary including:
+- Document type
+- Issuing institution or vendor
+- Account holder name(s)
+- Account/reference numbers (show only last 4 digits)
 - Date range or transaction date
-- Total amounts, balances, or invoice totals
-- Key individual transactions or line items (top 10 by amount if more exist)
-- Any anomalies, handwritten annotations, or irregularities noted
+- Totals, balances, or invoice amounts
+- Top 10 individual transactions or line items by amount
+- Any anomalies, handwritten annotations, or irregularities
 
 Be factual and precise. Use bullet points.
 ```
@@ -281,13 +507,14 @@ Be factual and precise. Use bullet points.
 
 | Scenario | Behavior |
 |---|---|
-| PDF has no images, only text | Skip Stages 2–4; still generate summary from extracted text |
-| Mixed PDF (some text pages, some image pages) | Image pages go through vision; text pages use native extraction; both feed summary |
-| Multi-image page (e.g., a page with a check image and a header logo) | Full page render captures all elements in context |
-| Vision model timeout on a page | Log warning, mark page as `transcription_failed`, continue with remaining pages |
-| Corrupt or password-protected PDF | Return structured MCP error with diagnostic message |
-| Very large PDF (>50 pages) | Process in batches of 10 pages; stream progress via MCP log messages |
-| `llama3.2-vision:90b` not available | Automatically fall back to `llama3.2-vision:11b` with a warning in the response |
+| PDF has no images, only text | Skip Stages 2–4; summarize existing text |
+| Mixed PDF | Image pages through vision; text pages use native extraction |
+| Vision model timeout | Mark page `transcription_failed`; continue remaining pages |
+| Corrupt or password-protected PDF | Return structured MCP error |
+| PDF > 50 pages | Process in batches of 10; emit MCP log progress messages |
+| `llama3.2-vision:90b` unavailable | Fallback to `:11b` with warning in response |
+| Nonce already seen | HTTP 401; client should generate a new nonce and retry |
+| Timestamp drift > 60s | HTTP 401; check system clock synchronization |
 
 ---
 
@@ -295,51 +522,68 @@ Be factual and precise. Use bullet points.
 
 ### Initial Setup
 
-1. **Write code locally** in `claw-my-spark/forensics-pdf-mcp/`
-2. **Push or rsync to remote**:
-   ```bash
-   rsync -av ./forensics-pdf-mcp/ claude@dgx-spark-claude:~/projects/claw-my-spark/forensics-pdf-mcp/
-   ```
-3. **Build and start the container** on the remote:
-   ```bash
-   ssh claude@dgx-spark-claude "cd ~/projects/claw-my-spark && docker compose build forensics-pdf-mcp && docker compose up -d forensics-pdf-mcp"
-   ```
+```bash
+# 1. Sync source to DGX Spark
+rsync -av ./forensics-pdf-mcp/ claude@dgx-spark-claude:~/projects/claw-my-spark/forensics-pdf-mcp/
+
+# 2. Build and start
+ssh claude@dgx-spark-claude "cd ~/projects/claw-my-spark && \
+  docker compose build forensics-pdf-mcp && \
+  docker compose up -d forensics-pdf-mcp"
+
+# 3. Initialize the database
+ssh claude@dgx-spark-claude "docker exec forensics-pdf-mcp python3 -c \
+  'from auth.key_registry import KeyRegistry; KeyRegistry(\"/data/keys.db\").init()'"
+
+# 4. Generate client keypair (on local machine)
+python3 forensics-pdf-mcp/admin/keygen.py --client-name "$(hostname)" \
+  --output-dir ~/.forensics-pdf-mcp/
+
+# 5. Register public key with server
+docker exec -i forensics-pdf-mcp python3 admin/register_client.py \
+  --key-id "$(cat ~/.forensics-pdf-mcp/key_id.txt)" \
+  --client-name "$(hostname)" \
+  --public-key "$(cat ~/.forensics-pdf-mcp/public_key.pem)"
+```
 
 ### Iterative Development
 
-- Edit code locally
-- Rsync changed files
-- Rebuild container: `docker compose build forensics-pdf-mcp && docker compose restart forensics-pdf-mcp`
-- Tail logs: `docker logs -f forensics-pdf-mcp`
+```bash
+rsync -av ./forensics-pdf-mcp/ claude@dgx-spark-claude:~/projects/claw-my-spark/forensics-pdf-mcp/
+ssh claude@dgx-spark-claude "cd ~/projects/claw-my-spark && \
+  docker compose build forensics-pdf-mcp && \
+  docker compose restart forensics-pdf-mcp"
+docker logs -f forensics-pdf-mcp
+```
 
-### Testing the Pipeline Directly
+### Test the Pipeline Directly
 
 ```bash
-ssh claude@dgx-spark-claude \
-  "docker exec -i forensics-pdf-mcp python3 -c \
-   'from pdf_processor import process_pdf; import asyncio; print(asyncio.run(process_pdf(\"/workspace/test.pdf\")))'"
+# Copy a test PDF into the workspace
+scp test.pdf claude@dgx-spark-claude:/tmp/forensics-pdf-mcp/
+
+# Run the pipeline
+ssh claude@dgx-spark-claude "docker exec forensics-pdf-mcp python3 -c \
+  'from pdf_processor import process_pdf; import asyncio; \
+   r = asyncio.run(process_pdf(\"/workspace/test.pdf\")); print(r[\"summary\"])'"
 ```
 
-### Configuring Claude Code
+### Test the HTTP Client
 
-Add to `~/.claude/settings.json` on the local workstation:
+```bash
+python3 - <<'EOF'
+import asyncio
+from forensics-pdf-mcp.client.forensics_client import ForensicsClient
 
-```json
-{
-  "mcpServers": {
-    "forensics-pdf-mcp": {
-      "command": "ssh",
-      "args": [
-        "claude@dgx-spark-claude",
-        "docker", "exec", "-i", "forensics-pdf-mcp",
-        "python3", "server.py"
-      ]
-    }
-  }
-}
+async def main():
+    async with ForensicsClient() as c:
+        result = await c.process_pdf_file("test.pdf")
+        print(result.summary)
+        result.save_enriched("test_forensics.pdf")
+
+asyncio.run(main())
+EOF
 ```
-
-Restart Claude Code after saving. The `forensics-pdf-mcp` tool will appear in the tool list.
 
 ---
 
@@ -347,17 +591,21 @@ Restart Claude Code after saving. The `forensics-pdf-mcp` tool will appear in th
 
 | Model | Role | Why |
 |---|---|---|
-| `llama3.2-vision:90b` | Image-to-text transcription | Highest accuracy available on the DGX; critical for financial figures and account numbers |
-| `qwen3:32b` | Document summarization | Strong reasoning and structured output; appropriate for analytical summary tasks |
+| `llama3.2-vision:90b` | Image-to-text transcription | Highest on-device accuracy; critical for financial figures and account numbers |
+| `qwen3:32b` | Document summarization | Strong structured reasoning; appropriate for forensic analysis tasks |
 
-Both models are already pulled and available in the local Ollama instance. No internet access is required at runtime.
+Both are already pulled in the local Ollama instance. No internet required at runtime.
 
 ---
 
 ## Security Considerations
 
-- The container runs with no elevated privileges.
-- No ports are exposed — communication is exclusively via stdio through SSH.
-- PDF files processed via `file_base64` are written to `/workspace` inside the container, which maps to `/tmp/forensics-pdf-mcp` on the host. Files in `/tmp` are cleared on host reboot.
-- Sensitive financial data (account numbers, transaction history) never leaves the local network — all LLM inference happens on-device.
-- The Ollama endpoint (`localhost:11434`) is only accessible within the host network; it is not exposed to the internet by the existing stack configuration.
+| Area | Detail |
+|---|---|
+| Private key storage | Stored only on the client machine at `~/.forensics-pdf-mcp/private_key.pem` (chmod 600). Never sent to the server. |
+| Key transport | Public keys are registered out-of-band via `docker exec` (requires SSH access to DGX). |
+| Network exposure | HTTP port (18790) is on the LAN only. Not routed through ExpressVPN. Not exposed to the internet by the existing stack. |
+| stdio path | Gated by SSH key authorization. No additional auth layer needed. |
+| Financial data | All LLM inference is on-device. Extracted text and PDFs never leave the local network. |
+| Workspace files | `/tmp/forensics-pdf-mcp` on host — cleared on reboot. The `forensics-pdf-keys` volume persists key registrations across container restarts. |
+| Key revocation | Set `active = 0` in SQLite immediately stops accepting requests from that key without container restart. |
