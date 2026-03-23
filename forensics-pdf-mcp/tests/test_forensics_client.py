@@ -6,20 +6,18 @@ is required.
 """
 
 import base64
-import hashlib
 import json
 import uuid
 
 import httpx
 import pytest
 import respx
-from cryptography.exceptions import InvalidSignature
 
 from auth.signing import verify_signature
 from client.forensics_client import ForensicsClient, ProcessResult
 
 SERVER_URL = "http://test-server:18790"
-MCP_URL = f"{SERVER_URL}/mcp"
+MCP_URL = f"{SERVER_URL}/mcp/"
 
 SAMPLE_RESULT = {
     "summary": "Bank statement for account ending 1234. Balance: $1,500.00.",
@@ -30,16 +28,52 @@ SAMPLE_RESULT = {
     "images_transcribed": 2,
 }
 
-MCP_RESPONSE = {
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "content": [{"type": "text", "text": json.dumps(SAMPLE_RESULT)}]
-    },
+# SSE-formatted final tool result
+_TOOL_SSE = (
+    "event: message\n"
+    "data: " + json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"content": [{"type": "text", "text": json.dumps(SAMPLE_RESULT)}]},
+    }) + "\n\n"
+)
+
+# SSE-formatted initialize response
+_INIT_SSE = (
+    "event: message\n"
+    "data: " + json.dumps({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": {"protocolVersion": "2025-03-26", "capabilities": {}},
+    }) + "\n\n"
+)
+
+_INIT_HEADERS = {
+    "content-type": "text/event-stream",
+    "mcp-session-id": "test-session-123",
 }
+_TOOL_HEADERS = {"content-type": "text/event-stream"}
 
 
-def make_client(ec_keypair, tmp_path):
+def _sse_response(text, headers):
+    return httpx.Response(200, text=text, headers=headers)
+
+
+def _mock_mcp(route):
+    """Side-effect: return init response for the first call, tool response for subsequent."""
+    call_count = 0
+
+    def handler(request):
+        nonlocal call_count
+        body = json.loads(request.content)
+        if body.get("method") == "initialize":
+            return _sse_response(_INIT_SSE, _INIT_HEADERS)
+        return _sse_response(_TOOL_SSE, _TOOL_HEADERS)
+
+    route.mock(side_effect=handler)
+
+
+def make_client(ec_keypair):
     key_id, private_pem, _ = ec_keypair
     return ForensicsClient(
         server_url=SERVER_URL,
@@ -53,8 +87,8 @@ def make_client(ec_keypair, tmp_path):
 async def test_process_pdf_bytes_returns_result(ec_keypair, tmp_path):
     """process_pdf_bytes returns a properly populated ProcessResult."""
     with respx.mock:
-        respx.post(MCP_URL).mock(return_value=httpx.Response(200, json=MCP_RESPONSE))
-        async with make_client(ec_keypair, tmp_path) as client:
+        _mock_mcp(respx.post(MCP_URL))
+        async with make_client(ec_keypair) as client:
             result = await client.process_pdf_bytes(b"%PDF-1.4 test", "test.pdf")
 
     assert isinstance(result, ProcessResult)
@@ -66,51 +100,56 @@ async def test_process_pdf_bytes_returns_result(ec_keypair, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_auth_headers_present(ec_keypair, tmp_path):
+async def test_auth_headers_present(ec_keypair):
     """Every request carries all four X-Auth-* headers."""
-    captured_request = None
+    tool_request = None
 
-    def capture(request):
-        nonlocal captured_request
-        captured_request = request
-        return httpx.Response(200, json=MCP_RESPONSE)
+    def handler(request):
+        nonlocal tool_request
+        body = json.loads(request.content)
+        if body.get("method") == "initialize":
+            return _sse_response(_INIT_SSE, _INIT_HEADERS)
+        tool_request = request
+        return _sse_response(_TOOL_SSE, _TOOL_HEADERS)
 
     with respx.mock:
-        respx.post(MCP_URL).mock(side_effect=capture)
-        async with make_client(ec_keypair, tmp_path) as client:
+        respx.post(MCP_URL).mock(side_effect=handler)
+        async with make_client(ec_keypair) as client:
             await client.process_pdf_bytes(b"%PDF-1.4", "doc.pdf")
 
-    assert captured_request is not None
+    assert tool_request is not None
     for header in ["X-Auth-Key-ID", "X-Auth-Timestamp", "X-Auth-Nonce", "X-Auth-Signature"]:
-        assert header in captured_request.headers, f"Missing header: {header}"
+        assert header in tool_request.headers, f"Missing header: {header}"
 
 
 @pytest.mark.asyncio
-async def test_signature_is_valid_over_request_body(ec_keypair, tmp_path):
+async def test_signature_is_valid_over_request_body(ec_keypair):
     """The X-Auth-Signature in the request is a valid ECDSA signature over the body."""
     key_id, private_pem, public_pem = ec_keypair
-    captured_request = None
+    tool_request = None
 
-    def capture(request):
-        nonlocal captured_request
-        captured_request = request
-        return httpx.Response(200, json=MCP_RESPONSE)
+    def handler(request):
+        nonlocal tool_request
+        body = json.loads(request.content)
+        if body.get("method") == "initialize":
+            return _sse_response(_INIT_SSE, _INIT_HEADERS)
+        tool_request = request
+        return _sse_response(_TOOL_SSE, _TOOL_HEADERS)
 
     with respx.mock:
-        respx.post(MCP_URL).mock(side_effect=capture)
+        respx.post(MCP_URL).mock(side_effect=handler)
         async with ForensicsClient(
             server_url=SERVER_URL, key_id=key_id, private_key_pem=private_pem
         ) as client:
             await client.process_pdf_bytes(b"%PDF-1.4", "doc.pdf")
 
-    h = captured_request.headers
-    # Should not raise
+    h = tool_request.headers
     verify_signature(
         public_pem,
         h["X-Auth-Key-ID"],
         h["X-Auth-Timestamp"],
         h["X-Auth-Nonce"],
-        captured_request.content,
+        tool_request.content,
         h["X-Auth-Signature"],
     )
 
@@ -119,8 +158,8 @@ async def test_signature_is_valid_over_request_body(ec_keypair, tmp_path):
 async def test_save_enriched_writes_file(ec_keypair, tmp_path):
     """save_enriched writes the enriched PDF bytes to the given path."""
     with respx.mock:
-        respx.post(MCP_URL).mock(return_value=httpx.Response(200, json=MCP_RESPONSE))
-        async with make_client(ec_keypair, tmp_path) as client:
+        _mock_mcp(respx.post(MCP_URL))
+        async with make_client(ec_keypair) as client:
             result = await client.process_pdf_bytes(b"%PDF-1.4", "doc.pdf")
 
     out_path = tmp_path / "output.pdf"
@@ -130,10 +169,59 @@ async def test_save_enriched_writes_file(ec_keypair, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_server_error_raises(ec_keypair, tmp_path):
-    """An HTTP 500 from the server raises a RuntimeError."""
+async def test_server_error_raises(ec_keypair):
+    """An HTTP 500 from the server raises HTTPStatusError."""
+    def handler(request):
+        body = json.loads(request.content)
+        if body.get("method") == "initialize":
+            return _sse_response(_INIT_SSE, _INIT_HEADERS)
+        return httpx.Response(500, json={"error": "internal"})
+
     with respx.mock:
-        respx.post(MCP_URL).mock(return_value=httpx.Response(500, json={"error": "internal"}))
-        async with make_client(ec_keypair, tmp_path) as client:
+        respx.post(MCP_URL).mock(side_effect=handler)
+        async with make_client(ec_keypair) as client:
             with pytest.raises(httpx.HTTPStatusError):
                 await client.process_pdf_bytes(b"%PDF-1.4", "doc.pdf")
+
+
+@pytest.mark.asyncio
+async def test_progress_callback_fired(ec_keypair):
+    """Progress notifications in the SSE stream are forwarded to the callback."""
+    progress_events = []
+
+    progress_sse = (
+        "event: message\n"
+        "data: " + json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {"progressToken": "tok", "progress": 1, "total": 3},
+        }) + "\n\n"
+        "event: message\n"
+        "data: " + json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {"progressToken": "tok", "progress": 2, "total": 3},
+        }) + "\n\n"
+        "event: message\n"
+        "data: " + json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": json.dumps(SAMPLE_RESULT)}]},
+        }) + "\n\n"
+    )
+
+    def handler(request):
+        body = json.loads(request.content)
+        if body.get("method") == "initialize":
+            return _sse_response(_INIT_SSE, _INIT_HEADERS)
+        return _sse_response(progress_sse, _TOOL_HEADERS)
+
+    with respx.mock:
+        respx.post(MCP_URL).mock(side_effect=handler)
+        async with make_client(ec_keypair) as client:
+            await client.process_pdf_bytes(
+                b"%PDF-1.4", "doc.pdf",
+                progress_callback=lambda done, total: progress_events.append((done, total)),
+            )
+
+    assert progress_events == [(1, 3), (2, 3)]

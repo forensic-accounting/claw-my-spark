@@ -24,7 +24,7 @@ import pathlib
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
 from auth.key_registry import KeyRegistry
 from auth.middleware import ECDSAAuthMiddleware
@@ -54,6 +54,7 @@ mcp = FastMCP("forensics-pdf-mcp")
 
 @mcp.tool()
 async def process_pdf(
+    ctx: Context,
     file_path: str | None = None,
     file_base64: str | None = None,
     filename: str | None = None,
@@ -86,6 +87,9 @@ async def process_pdf(
             {"error": "Provide either file_path or both file_base64 and filename"}
         )
 
+    async def _on_progress(done: int, total: int) -> None:
+        await ctx.report_progress(done, total)
+
     try:
         result = await process_pdf_pipeline(
             pdf_bytes=pdf_bytes,
@@ -94,6 +98,7 @@ async def process_pdf(
             ollama_base_url=OLLAMA_BASE_URL,
             vision_model=VISION_MODEL,
             summary_model=SUMMARY_MODEL,
+            progress_callback=_on_progress,
         )
     except Exception as exc:
         logger.exception("Pipeline error")

@@ -106,7 +106,7 @@ class ForensicsClient:
         key_id: Optional[str] = None,
         private_key_pem: Optional[str] = None,
         config_dir: str | pathlib.Path = "~/.forensics-pdf-mcp/",
-        timeout: float = 300.0,
+        timeout: float = 700.0,
     ) -> None:
         config_dir = pathlib.Path(config_dir).expanduser()
 
@@ -138,10 +138,12 @@ class ForensicsClient:
             base_url=self._server_url.rstrip("/"),
             timeout=timeout,
         )
+        self._session_id: Optional[str] = None
 
     # --- Context manager ---
 
     async def __aenter__(self) -> "ForensicsClient":
+        await self._initialize_session()
         return self
 
     async def __aexit__(self, *_) -> None:
@@ -149,21 +151,47 @@ class ForensicsClient:
 
     # --- Public API ---
 
-    async def process_pdf_file(self, path: str | pathlib.Path) -> ProcessResult:
-        """Submit a local PDF file for forensic processing."""
+    async def process_pdf_file(
+        self,
+        path: str | pathlib.Path,
+        progress_callback=None,
+    ) -> ProcessResult:
+        """Submit a local PDF file for forensic processing.
+
+        Args:
+            path:              Path to the PDF file.
+            progress_callback: Optional callable(done, total) called after each
+                               image page is OCR'd.  Use it to display progress.
+                               Example::
+
+                                   def on_progress(done, total):
+                                       print(f"{done}/{total} pages processed")
+        """
         path = pathlib.Path(path)
-        return await self.process_pdf_bytes(path.read_bytes(), filename=path.name)
+        return await self.process_pdf_bytes(
+            path.read_bytes(), filename=path.name, progress_callback=progress_callback
+        )
 
     async def process_pdf_bytes(
-        self, pdf_bytes: bytes, filename: str = "document.pdf"
+        self,
+        pdf_bytes: bytes,
+        filename: str = "document.pdf",
+        progress_callback=None,
     ) -> ProcessResult:
-        """Submit raw PDF bytes for forensic processing."""
+        """Submit raw PDF bytes for forensic processing.
+
+        Args:
+            pdf_bytes:         Raw PDF content.
+            filename:          Original filename (used server-side for output naming).
+            progress_callback: Optional callable(done, total) — see process_pdf_file.
+        """
         result_dict = await self._call_tool(
             "process_pdf",
             {
                 "file_base64": base64.b64encode(pdf_bytes).decode(),
                 "filename": filename,
             },
+            progress_callback=progress_callback,
         )
         if "error" in result_dict:
             raise RuntimeError(f"Server error: {result_dict['error']}")
@@ -178,29 +206,86 @@ class ForensicsClient:
 
     # --- Internal ---
 
-    async def _call_tool(self, tool_name: str, arguments: dict) -> dict:
+    async def _initialize_session(self) -> None:
+        """Send MCP initialize handshake and store the session ID."""
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "forensics-pdf-mcp-client", "version": "0.1.0"},
+            },
+        }).encode()
+        auth_headers = _sign_request(self._private_key_pem, self._key_id, payload)
+        auth_headers["Content-Type"] = "application/json"
+        auth_headers["Accept"] = "application/json, text/event-stream"
+        resp = await self._http.post("/mcp/", content=payload, headers=auth_headers)
+        resp.raise_for_status()
+        self._session_id = resp.headers.get("mcp-session-id")
+
+    async def _call_tool(
+        self, tool_name: str, arguments: dict, progress_callback=None
+    ) -> dict:
+        """Call an MCP tool, streaming SSE events as they arrive.
+
+        Progress notifications (``notifications/progress``) are forwarded to
+        *progress_callback(done, total)* if provided.  The final JSON-RPC
+        result is returned once the stream ends.
+        """
+        progress_token = str(uuid.uuid4())
         payload = json.dumps({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+                "_meta": {"progressToken": progress_token},
+            },
         }).encode()
 
         auth_headers = _sign_request(self._private_key_pem, self._key_id, payload)
         auth_headers["Content-Type"] = "application/json"
+        auth_headers["Accept"] = "application/json, text/event-stream"
+        if self._session_id:
+            auth_headers["Mcp-Session-Id"] = self._session_id
 
-        resp = await self._http.post("/mcp/", content=payload, headers=auth_headers)
-        resp.raise_for_status()
+        async with self._http.stream(
+            "POST", "/mcp/", content=payload, headers=auth_headers
+        ) as resp:
+            resp.raise_for_status()
+            result_data = None
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                event = json.loads(line[len("data:"):].strip())
 
-        data = resp.json()
-        if "error" in data:
-            raise RuntimeError(f"MCP error: {data['error']}")
+                # Progress notification — fire callback and keep reading
+                if event.get("method") == "notifications/progress":
+                    if progress_callback:
+                        params = event.get("params", {})
+                        progress_callback(
+                            params.get("progress", 0),
+                            params.get("total", 0),
+                        )
+                    continue
 
-        # MCP tool result is in data["result"]["content"][0]["text"]
-        content = data.get("result", {}).get("content", [])
+                # Final result or error
+                if "result" in event or "error" in event:
+                    result_data = event
+                    break
+
+        if result_data is None:
+            raise RuntimeError("No result received from MCP server")
+        if "error" in result_data:
+            raise RuntimeError(f"MCP error: {result_data['error']}")
+
+        content = result_data.get("result", {}).get("content", [])
         if content and content[0].get("type") == "text":
             return json.loads(content[0]["text"])
-        raise RuntimeError(f"Unexpected MCP response structure: {data}")
+        raise RuntimeError(f"Unexpected MCP response structure: {result_data}")
 
     @staticmethod
     def _read_file(path: pathlib.Path) -> Optional[str]:

@@ -39,6 +39,7 @@ async def process_pdf_pipeline(
     ollama_base_url: str,
     vision_model: str,
     summary_model: str,
+    progress_callback=None,  # async callable(done: int, total: int) or None
 ) -> dict:
     """
     Run the full forensics pipeline on a PDF.
@@ -80,7 +81,7 @@ async def process_pdf_pipeline(
             ]
             results = await asyncio.gather(*tasks)
 
-            for pi, transcribed_text in results:
+            for idx, (pi, transcribed_text) in enumerate(results):
                 if transcribed_text and not transcribed_text.startswith("__FAILED__"):
                     # Stage 4: embed invisible text
                     page = doc[pi]
@@ -96,12 +97,25 @@ async def process_pdf_pipeline(
                 elif transcribed_text.startswith("__FAILED__"):
                     logger.warning("Transcription failed for page %d", pi + 1)
 
+                # Report per-page progress
+                if progress_callback:
+                    done = batch_start + idx + 1
+                    await progress_callback(done, len(image_page_indices))
+
     # Stage 5: generate summary from all collected text
+    # Cap input to ~40,000 chars to keep within model context/timeout bounds.
+    MAX_SUMMARY_CHARS = 40_000
     all_text_parts = [
         f"[Page {i + 1}]\n{text}"
         for i, text in sorted(text_parts.items())
     ]
     full_text = "\n\n".join(all_text_parts)
+    if len(full_text) > MAX_SUMMARY_CHARS:
+        logger.warning(
+            "Document text (%d chars) exceeds limit; truncating to %d chars for summary",
+            len(full_text), MAX_SUMMARY_CHARS,
+        )
+        full_text = full_text[:MAX_SUMMARY_CHARS] + "\n\n[... document truncated for summary ...]"
 
     if full_text.strip():
         try:

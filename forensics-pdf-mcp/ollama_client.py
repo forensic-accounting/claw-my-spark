@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _VISION_SEMAPHORE = asyncio.Semaphore(3)
 
 VISION_TIMEOUT = 180.0   # seconds — 90b model can take 30–90s per page
-SUMMARY_TIMEOUT = 300.0
+SUMMARY_TIMEOUT = 600.0
 
 VISION_PROMPT = (
     "You are a forensic document analyst and OCR assistant. "
