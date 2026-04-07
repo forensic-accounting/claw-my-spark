@@ -17,9 +17,9 @@ guard-%:
 
 setup:
 	if [ ! -d "venv" ]; then \
-		python3.11 -m venv venv && \
+		python3.12 -m venv venv && \
 		. venv/bin/activate && \
-		pip install --index-url=https://artprod.dev.bloomberg.com/artifactory/api/pypi/bloomberg-pypi/simple -r requirements-dev.txt; \
+		pip install -e ./forensics-pdf-mcp; \
 	fi
 
 
