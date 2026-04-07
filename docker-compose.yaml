@@ -127,7 +127,7 @@ services:
     environment:
       OLLAMA_BASE_URL: "http://localhost:11434"
       VISION_MODEL: "llama3.2-vision:90b"
-      SUMMARY_MODEL: "qwen3:32b"
+      SUMMARY_MODEL: "qwen3:14b"
       WORKSPACE_DIR: "/workspace"
       DB_PATH: "/data/keys.db"
       HTTP_PORT: "${FORENSICS_PDF_MCP_PORT:-18790}"

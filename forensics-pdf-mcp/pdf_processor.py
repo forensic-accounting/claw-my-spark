@@ -40,6 +40,7 @@ async def process_pdf_pipeline(
     vision_model: str,
     summary_model: str,
     progress_callback=None,  # async callable(done: int, total: int) or None
+    status_callback=None,    # async callable(message: str) or None
 ) -> dict:
     """
     Run the full forensics pipeline on a PDF.
@@ -53,7 +54,23 @@ async def process_pdf_pipeline(
     )
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # Detect re-submission of an already-enriched PDF
+    if "forensics-enriched" in (doc.metadata.get("keywords") or ""):
+        doc.close()
+        return {
+            "summary": "This document has already been forensically processed.",
+            "enriched_pdf_base64": base64.b64encode(pdf_bytes).decode(),
+            "enriched_pdf_path": "",
+            "had_embedded_images": False,
+            "pages_processed": 0,
+            "images_transcribed": 0,
+        }
+
     total_pages = doc.page_count
+
+    if status_callback:
+        await status_callback(f"Classifying {total_pages} pages...")
 
     # Stage 1: classify pages
     image_page_indices = []
@@ -70,6 +87,18 @@ async def process_pdf_pipeline(
 
     had_embedded_images = len(image_page_indices) > 0
     images_transcribed = 0
+
+    if status_callback:
+        n_image = len(image_page_indices)
+        n_text = total_pages - n_image
+        if had_embedded_images:
+            await status_callback(
+                f"Classification complete: {n_image} image page(s), {n_text} text page(s). Starting OCR..."
+            )
+        else:
+            await status_callback(
+                f"Classification complete: {n_text} native-text page(s), no image pages."
+            )
 
     if had_embedded_images:
         # Stages 2+3+4: render, transcribe, embed in batches
@@ -118,6 +147,11 @@ async def process_pdf_pipeline(
         full_text = full_text[:MAX_SUMMARY_CHARS] + "\n\n[... document truncated for summary ...]"
 
     if full_text.strip():
+        if status_callback:
+            await status_callback(
+                f"Generating summary from {len(text_parts)} page(s) "
+                f"({len(full_text):,} chars) using {summary_model}..."
+            )
         try:
             summary = await generate_summary(full_text, summary_model, ollama_base_url)
         except Exception as exc:
@@ -126,8 +160,27 @@ async def process_pdf_pipeline(
     else:
         summary = "No extractable text content found in this document."
 
+    # Stamp page 1 with a small footer and set document metadata
+    from datetime import datetime, timezone as _tz
+    processed_at = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    footer = f"Forensically enriched  |  {processed_at}"
+    first_page = doc[0]
+    footer_y = first_page.rect.height - 6
+    first_page.insert_text(
+        fitz.Point(4, footer_y),
+        footer,
+        fontsize=6,
+        color=(0.55, 0.55, 0.55),
+    )
+
+    existing_keywords = (doc.metadata.get("keywords") or "").strip()
+    doc.set_metadata({
+        **doc.metadata,
+        "keywords": f"forensics-enriched {existing_keywords}".strip(),
+    })
+
     # Save enriched PDF
-    out_path = pathlib.Path(workspace_dir) / f"{output_stem}_forensics.pdf"
+    out_path = pathlib.Path(workspace_dir) / f"{output_stem}.pdf"
     enriched_bytes = doc.tobytes(garbage=4, deflate=True)
     out_path.write_bytes(enriched_bytes)
     doc.close()
@@ -135,7 +188,7 @@ async def process_pdf_pipeline(
     return {
         "summary": summary,
         "enriched_pdf_base64": base64.b64encode(enriched_bytes).decode(),
-        "enriched_pdf_path": str(out_path),
+        "enriched_pdf_path": str(out_path),  # {output_stem}.pdf (no suffix — metadata inside identifies it)
         "had_embedded_images": had_embedded_images,
         "pages_processed": total_pages,
         "images_transcribed": images_transcribed,

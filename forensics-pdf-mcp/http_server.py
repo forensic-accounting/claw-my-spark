@@ -12,6 +12,7 @@ Environment variables:
     SUMMARY_MODEL     default qwen3:32b
     WORKSPACE_DIR     default /workspace
     DB_PATH           default /data/keys.db
+    CACHE_DIR         default /data/pdf_cache
     HTTP_PORT         default 18790
 """
 
@@ -28,6 +29,7 @@ from fastmcp import Context, FastMCP
 
 from auth.key_registry import KeyRegistry
 from auth.middleware import ECDSAAuthMiddleware
+from pdf_cache import PdfCache, slugify
 from pdf_processor import process_pdf_pipeline
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +41,7 @@ VISION_MODEL = os.getenv("VISION_MODEL", "llama3.2-vision:90b")
 SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "qwen3:32b")
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace")
 DB_PATH = os.getenv("DB_PATH", "/data/keys.db")
+CACHE_DIR = os.getenv("CACHE_DIR", "/data/pdf_cache")
 HTTP_PORT = int(os.getenv("HTTP_PORT", "18790"))
 
 # --- Ensure workspace exists ---
@@ -47,6 +50,9 @@ pathlib.Path(WORKSPACE_DIR).mkdir(parents=True, exist_ok=True)
 # --- Key registry (initialised before app creation so middleware can use it) ---
 registry = KeyRegistry(DB_PATH)
 registry.init_db()
+
+# --- PDF result cache ---
+cache = PdfCache(CACHE_DIR)
 
 # --- FastMCP server ---
 mcp = FastMCP("forensics-pdf-mcp")
@@ -87,8 +93,24 @@ async def process_pdf(
             {"error": "Provide either file_path or both file_base64 and filename"}
         )
 
+    # --- Cache lookup ---
+    cached = cache.get(pdf_bytes)
+    if cached is not None:
+        await ctx.info(f"Cache hit — returning stored result for {cached.filename}")
+        return json.dumps({
+            "summary": cached.summary,
+            "enriched_pdf_base64": base64.b64encode(cached.enriched_pdf).decode(),
+            "enriched_pdf_path": f"{WORKSPACE_DIR}/{slugify(cached.filename)}.pdf",
+            "had_embedded_images": cached.had_embedded_images,
+            "pages_processed": cached.pages_processed,
+            "images_transcribed": cached.images_transcribed,
+        })
+
     async def _on_progress(done: int, total: int) -> None:
         await ctx.report_progress(done, total)
+
+    async def _on_status(message: str) -> None:
+        await ctx.info(message)
 
     try:
         result = await process_pdf_pipeline(
@@ -99,10 +121,25 @@ async def process_pdf(
             vision_model=VISION_MODEL,
             summary_model=SUMMARY_MODEL,
             progress_callback=_on_progress,
+            status_callback=_on_status,
         )
     except Exception as exc:
         logger.exception("Pipeline error")
         return json.dumps({"error": str(exc)})
+
+    # --- Store in cache ---
+    try:
+        cache.put(
+            pdf_bytes=pdf_bytes,
+            filename=output_stem,
+            summary=result["summary"],
+            enriched_pdf=base64.b64decode(result["enriched_pdf_base64"]),
+            had_embedded_images=result["had_embedded_images"],
+            pages_processed=result["pages_processed"],
+            images_transcribed=result["images_transcribed"],
+        )
+    except Exception:
+        logger.exception("Failed to store result in cache (non-fatal)")
 
     return json.dumps(result)
 

@@ -155,21 +155,23 @@ class ForensicsClient:
         self,
         path: str | pathlib.Path,
         progress_callback=None,
+        status_callback=None,
     ) -> ProcessResult:
         """Submit a local PDF file for forensic processing.
 
         Args:
             path:              Path to the PDF file.
-            progress_callback: Optional callable(done, total) called after each
-                               image page is OCR'd.  Use it to display progress.
-                               Example::
-
-                                   def on_progress(done, total):
-                                       print(f"{done}/{total} pages processed")
+            progress_callback: Optional callable(done, total) — fired after each
+                               image page is OCR'd.
+            status_callback:   Optional callable(message) — fired for text status
+                               updates (classification complete, summary started, etc.).
         """
         path = pathlib.Path(path)
         return await self.process_pdf_bytes(
-            path.read_bytes(), filename=path.name, progress_callback=progress_callback
+            path.read_bytes(),
+            filename=path.name,
+            progress_callback=progress_callback,
+            status_callback=status_callback,
         )
 
     async def process_pdf_bytes(
@@ -177,6 +179,7 @@ class ForensicsClient:
         pdf_bytes: bytes,
         filename: str = "document.pdf",
         progress_callback=None,
+        status_callback=None,
     ) -> ProcessResult:
         """Submit raw PDF bytes for forensic processing.
 
@@ -184,6 +187,7 @@ class ForensicsClient:
             pdf_bytes:         Raw PDF content.
             filename:          Original filename (used server-side for output naming).
             progress_callback: Optional callable(done, total) — see process_pdf_file.
+            status_callback:   Optional callable(message) — see process_pdf_file.
         """
         result_dict = await self._call_tool(
             "process_pdf",
@@ -192,6 +196,7 @@ class ForensicsClient:
                 "filename": filename,
             },
             progress_callback=progress_callback,
+            status_callback=status_callback,
         )
         if "error" in result_dict:
             raise RuntimeError(f"Server error: {result_dict['error']}")
@@ -226,7 +231,7 @@ class ForensicsClient:
         self._session_id = resp.headers.get("mcp-session-id")
 
     async def _call_tool(
-        self, tool_name: str, arguments: dict, progress_callback=None
+        self, tool_name: str, arguments: dict, progress_callback=None, status_callback=None
     ) -> dict:
         """Call an MCP tool, streaming SSE events as they arrive.
 
@@ -270,6 +275,17 @@ class ForensicsClient:
                             params.get("progress", 0),
                             params.get("total", 0),
                         )
+                    continue
+
+                # Status/log notification from ctx.info()
+                if event.get("method") == "notifications/message":
+                    if status_callback:
+                        params = event.get("params", {})
+                        data = params.get("data", "")
+                        # FastMCP wraps the message as {"msg": "...", "extra": ...}
+                        if isinstance(data, dict):
+                            data = data.get("msg", str(data))
+                        status_callback(data)
                     continue
 
                 # Final result or error
