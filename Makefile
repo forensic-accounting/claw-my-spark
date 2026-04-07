@@ -31,3 +31,6 @@ down:
 
 build:
 	docker compose -f docker-compose.yaml build
+
+test:
+	source venv/bin/activate && python tests/test.py
