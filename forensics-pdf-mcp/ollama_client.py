@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Cap simultaneous vision calls to avoid OOM on the 90b model
 _VISION_SEMAPHORE = asyncio.Semaphore(3)
 
-VISION_TIMEOUT = 180.0   # seconds — 90b model can take 30–90s per page
+VISION_TIMEOUT = 900.0   # seconds — 90b model on DGX Spark takes ~10–12 min per page
 SUMMARY_TIMEOUT = 600.0
 
 VISION_PROMPT = (
@@ -80,10 +80,17 @@ async def transcribe_page_image(
     }
 
     async with _VISION_SEMAPHORE:
-        async with httpx.AsyncClient(timeout=VISION_TIMEOUT) as client:
+        # Use timeout=None on the httpx client and wrap with asyncio.wait_for so
+        # the limit is a true wall-clock total, not a per-chunk read timeout.
+        # (httpx's read timeout resets on each received chunk, so chunked ollama
+        # responses can silently run for many minutes past the intended limit.)
+        async with httpx.AsyncClient(timeout=None) as client:
             try:
-                resp = await client.post(
-                    f"{ollama_base_url.rstrip('/')}/api/chat", json=payload
+                resp = await asyncio.wait_for(
+                    client.post(
+                        f"{ollama_base_url.rstrip('/')}/api/chat", json=payload
+                    ),
+                    timeout=VISION_TIMEOUT,
                 )
                 resp.raise_for_status()
                 return resp.json()["message"]["content"]
@@ -96,8 +103,11 @@ async def transcribe_page_image(
                         fallback_model,
                     )
                     payload["model"] = fallback_model
-                    resp = await client.post(
-                        f"{ollama_base_url.rstrip('/')}/api/chat", json=payload
+                    resp = await asyncio.wait_for(
+                        client.post(
+                            f"{ollama_base_url.rstrip('/')}/api/chat", json=payload
+                        ),
+                        timeout=VISION_TIMEOUT,
                     )
                     resp.raise_for_status()
                     return resp.json()["message"]["content"]
