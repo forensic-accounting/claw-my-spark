@@ -114,6 +114,76 @@ async def transcribe_page_image(
                 raise
 
 
+async def assert_model_on_gpu(model: str, ollama_base_url: str) -> None:
+    """Verify a model is loaded on GPU. If not loaded, trigger a load and recheck.
+
+    Raises RuntimeError if the model ends up on CPU or cannot be loaded.
+    """
+    base = ollama_base_url.rstrip("/")
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        # Check if already loaded
+        resp = await client.get(f"{base}/api/ps")
+        resp.raise_for_status()
+        result = _check_gpu_status(model, resp.json())
+        if result is True:
+            return
+
+        # Model not loaded — trigger a load via empty generate request
+        logger.info("Model %s not loaded, triggering load...", model)
+        load_resp = await client.post(
+            f"{base}/api/generate",
+            json={"model": model, "prompt": "", "stream": False},
+        )
+        load_resp.raise_for_status()
+
+        # Re-check after load
+        resp = await client.get(f"{base}/api/ps")
+        resp.raise_for_status()
+        result = _check_gpu_status(model, resp.json())
+        if result is True:
+            return
+
+        raise RuntimeError(result)
+
+
+def _check_gpu_status(model: str, ps_response: dict) -> bool | str:
+    """Return True if model is on GPU, or an error message string."""
+    model_base = model.split(":")[0]
+    model_tag = model.split(":")[-1] if ":" in model else ""
+
+    for m in ps_response.get("models", []):
+        m_name = m.get("model", "")
+        if model_base in m_name and (not model_tag or model_tag in m_name):
+            size_vram = m.get("size_vram", 0)
+            size = m.get("size", 1)
+            gpu_pct = (size_vram / size * 100) if size else 0
+            if gpu_pct < 90:
+                return (
+                    f"Model {model} is only {gpu_pct:.0f}% on GPU "
+                    f"(VRAM {size_vram / 1e9:.1f}GB / total {size / 1e9:.1f}GB). "
+                    f"Aborting — CPU-only inference is too slow."
+                )
+            logger.info("Model %s verified on GPU (%.0f%% VRAM)", model, gpu_pct)
+            return True
+
+    return f"Model {model} is not loaded in Ollama."
+
+
+async def unload_model(model: str, ollama_base_url: str) -> None:
+    """Unload a model from GPU memory so another model can be loaded."""
+    payload = {"model": model, "keep_alive": 0}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.post(
+                f"{ollama_base_url.rstrip('/')}/api/generate", json=payload
+            )
+            resp.raise_for_status()
+            logger.info("Unloaded model %s", model)
+        except Exception as exc:
+            logger.warning("Failed to unload model %s: %s", model, exc)
+
+
 async def generate_summary(
     full_text: str,
     model: str,

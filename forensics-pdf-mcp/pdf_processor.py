@@ -19,7 +19,7 @@ from typing import Optional
 
 import fitz  # PyMuPDF
 
-from ollama_client import generate_summary, transcribe_page_image
+from ollama_client import assert_model_on_gpu, generate_summary, transcribe_page_image, unload_model
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,9 @@ async def process_pdf_pipeline(
             )
 
     if had_embedded_images:
+        # GPU failsafe: verify vision model is loaded on GPU before starting OCR
+        await assert_model_on_gpu(vision_model, ollama_base_url)
+
         # Stages 2+3+4: render, transcribe, embed in batches
         for batch_start in range(0, len(image_page_indices), BATCH_SIZE):
             batch = image_page_indices[batch_start : batch_start + BATCH_SIZE]
@@ -131,6 +134,10 @@ async def process_pdf_pipeline(
                     done = batch_start + idx + 1
                     await progress_callback(done, len(image_page_indices))
 
+    # Unload vision model to free GPU memory for the summary model
+    if had_embedded_images:
+        await unload_model(vision_model, ollama_base_url)
+
     # Stage 5: generate summary from all collected text
     # Cap input to ~40,000 chars to keep within model context/timeout bounds.
     MAX_SUMMARY_CHARS = 40_000
@@ -153,6 +160,8 @@ async def process_pdf_pipeline(
                 f"({len(full_text):,} chars) using {summary_model}..."
             )
         try:
+            # GPU failsafe: verify summary model is on GPU before generating
+            await assert_model_on_gpu(summary_model, ollama_base_url)
             summary = await generate_summary(full_text, summary_model, ollama_base_url)
         except Exception as exc:
             logger.error("Summary generation failed: %s: %s", type(exc).__name__, exc)

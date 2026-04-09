@@ -57,6 +57,7 @@ services:
   # Requires NET_ADMIN capability and /dev/net/tun device.
   # ---------------------------------------------------------------------------
   expressvpn:
+    profiles: ["openclaw"]
     build:
       context: ./expressvpn
       dockerfile: Dockerfile
@@ -88,6 +89,7 @@ services:
   # expressvpn/entrypoint.sh). Port 18789 is owned by the expressvpn service.
   # ---------------------------------------------------------------------------
   openclaw:
+    profiles: ["openclaw"]
     build:
       context: ./openclaw
       dockerfile: Dockerfile
@@ -142,6 +144,7 @@ services:
   # Proxies to expressvpn:18789 (which forwards to openclaw via shared network).
   # ---------------------------------------------------------------------------
   caddy:
+    profiles: ["openclaw"]
     image: caddy:latest
     container_name: caddy
     restart: always
