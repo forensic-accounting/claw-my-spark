@@ -128,8 +128,10 @@ services:
       - forensics-pdf-keys:/data
     environment:
       OLLAMA_BASE_URL: "http://localhost:11434"
-      VISION_MODEL: "llama3.2-vision:90b"
-      SUMMARY_MODEL: "qwen3:14b"
+      # VISION_MODEL: "llama3.2-vision:90b"
+      # SUMMARY_MODEL: "qwen3:32b"
+      VISION_MODEL: "gemma4:31b"
+      SUMMARY_MODEL: "gemma4:31b"
       WORKSPACE_DIR: "/workspace"
       DB_PATH: "/data/keys.db"
       HTTP_PORT: "${FORENSICS_PDF_MCP_PORT:-18790}"

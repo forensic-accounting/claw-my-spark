@@ -184,6 +184,46 @@ async def unload_model(model: str, ollama_base_url: str) -> None:
             logger.warning("Failed to unload model %s: %s", model, exc)
 
 
+async def verify_model_unloaded(model: str, ollama_base_url: str) -> None:
+    """Verify a model is fully unloaded from GPU.  Retries up to 3 times.
+
+    Raises RuntimeError if the model is still loaded after all retries.
+    """
+    base = ollama_base_url.rstrip("/")
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{base}/api/ps")
+            resp.raise_for_status()
+            ps = resp.json()
+
+        model_base = model.split(":")[0]
+        model_tag = model.split(":")[-1] if ":" in model else ""
+        still_loaded = False
+        for m in ps.get("models", []):
+            m_name = m.get("model", "")
+            if model_base in m_name and (not model_tag or model_tag in m_name):
+                still_loaded = True
+                break
+
+        if not still_loaded:
+            logger.info("Verified model %s is unloaded (attempt %d)", model, attempt + 1)
+            return
+
+        logger.warning(
+            "Model %s still loaded (attempt %d/%d), sending unload and waiting...",
+            model, attempt + 1, max_retries,
+        )
+        await unload_model(model, ollama_base_url)
+        await asyncio.sleep(5)
+
+    raise RuntimeError(
+        f"Model {model} is still loaded after {max_retries} unload attempts. "
+        f"Cannot proceed — GPU memory is not free."
+    )
+
+
 async def generate_summary(
     full_text: str,
     model: str,

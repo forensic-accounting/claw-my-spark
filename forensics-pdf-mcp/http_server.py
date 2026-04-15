@@ -31,6 +31,7 @@ from auth.key_registry import KeyRegistry
 from auth.middleware import ECDSAAuthMiddleware
 from pdf_cache import PdfCache, slugify
 from pdf_processor import process_pdf_pipeline
+from drive_sync import run_sync, get_synced_documents, get_document_enriched_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -142,6 +143,75 @@ async def process_pdf(
         logger.exception("Failed to store result in cache (non-fatal)")
 
     return json.dumps(result)
+
+
+@mcp.tool()
+async def sync_drive(
+    ctx: Context,
+    full: bool = False,
+) -> str:
+    """
+    Sync PDFs from Google Drive through the forensic OCR pipeline to S3.
+
+    Args:
+        full: If True, clear all sync state and re-process every file.
+              If False (default), only process new/modified files.
+
+    Returns a JSON summary with keys: synced, skipped, errors.
+    """
+    async def _on_status(message: str) -> None:
+        await ctx.info(message)
+
+    try:
+        totals = await run_sync(
+            full=full,
+            status_callback=_on_status,
+        )
+        return json.dumps(totals)
+    except Exception as exc:
+        logger.exception("Drive sync error")
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+async def list_synced_documents(
+    ctx: Context,
+    section: str | None = None,
+) -> str:
+    """
+    Return metadata for all synced documents. Instant — reads from cache.
+
+    Args:
+        section: Optional filter (HOA, Condo1, Condo2, Condo3, Condo4).
+                 If omitted, returns all sections.
+
+    Returns JSON array of document objects with keys:
+        drive_file_id, drive_name, section, s3_filename, s3_path,
+        description, last_synced_at
+    """
+    docs = get_synced_documents(section=section)
+    return json.dumps(docs)
+
+
+@mcp.tool()
+async def get_document_pdf(
+    ctx: Context,
+    drive_file_id: str,
+) -> str:
+    """
+    Return the enriched (OCR'd) PDF for a specific document.
+
+    Args:
+        drive_file_id: Google Drive file ID of the document.
+
+    Returns JSON with enriched_pdf_base64, or error.
+    """
+    pdf_bytes = get_document_enriched_pdf(drive_file_id)
+    if pdf_bytes is None:
+        return json.dumps({"error": f"Document not found: {drive_file_id}"})
+    return json.dumps({
+        "enriched_pdf_base64": base64.b64encode(pdf_bytes).decode(),
+    })
 
 
 # --- FastAPI app ---
