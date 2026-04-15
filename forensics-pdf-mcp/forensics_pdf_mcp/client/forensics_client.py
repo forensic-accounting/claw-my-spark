@@ -26,6 +26,7 @@ via constructor args or environment variables:
 import base64
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import uuid
@@ -143,7 +144,6 @@ class ForensicsClient:
     # --- Context manager ---
 
     async def __aenter__(self) -> "ForensicsClient":
-        await self._initialize_session()
         return self
 
     async def __aexit__(self, *_) -> None:
@@ -209,6 +209,47 @@ class ForensicsClient:
             enriched_pdf_path=result_dict["enriched_pdf_path"],
         )
 
+    async def submit_sync_job(
+        self,
+        google_credentials_json: str,
+        folders: list[dict[str, str]],
+    ) -> dict:
+        """Submit a Drive sync job for background processing.
+
+        Uses the REST endpoint (not MCP/SSE) for instant response.
+
+        Args:
+            google_credentials_json: Service-account JSON string.
+            folders: List of {"section": "HOA", "folder_id": "..."} dicts.
+
+        Returns dict with job_id and status, or error info if busy.
+        """
+        body = json.dumps({
+            "google_credentials_json": google_credentials_json,
+            "folders": folders,
+        }).encode()
+        auth_headers = _sign_request(self._private_key_pem, self._key_id, body)
+        auth_headers["Content-Type"] = "application/json"
+        resp = await self._http.post("/jobs/submit", content=body, headers=auth_headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_job_status(self, job_id: str) -> dict:
+        """Poll the status of a sync job.
+
+        Uses the REST endpoint (not MCP/SSE) for instant response.
+
+        Args:
+            job_id: The job ID returned by submit_sync_job.
+
+        Returns dict with job status, progress, and errors.
+        """
+        # GET request — sign an empty body
+        auth_headers = _sign_request(self._private_key_pem, self._key_id, b"")
+        resp = await self._http.get(f"/jobs/{job_id}", headers=auth_headers)
+        resp.raise_for_status()
+        return resp.json()
+
     # --- Internal ---
 
     async def _initialize_session(self) -> None:
@@ -231,14 +272,20 @@ class ForensicsClient:
         self._session_id = resp.headers.get("mcp-session-id")
 
     async def _call_tool(
-        self, tool_name: str, arguments: dict, progress_callback=None, status_callback=None
+        self, tool_name: str, arguments: dict,
+        progress_callback=None, status_callback=None,
+        _retried: bool = False,
     ) -> dict:
         """Call an MCP tool, streaming SSE events as they arrive.
+
+        Lazily initializes the MCP session on first use.
 
         Progress notifications (``notifications/progress``) are forwarded to
         *progress_callback(done, total)* if provided.  The final JSON-RPC
         result is returned once the stream ends.
         """
+        if self._session_id is None:
+            await self._initialize_session()
         progress_token = str(uuid.uuid4())
         payload = json.dumps({
             "jsonrpc": "2.0",
@@ -260,6 +307,19 @@ class ForensicsClient:
         async with self._http.stream(
             "POST", "/mcp/", content=payload, headers=auth_headers
         ) as resp:
+            if resp.status_code == 401 and not _retried:
+                # Session may have expired — re-initialize and retry once
+                await resp.aread()
+                logging.getLogger(__name__).warning(
+                    "Got 401, re-initializing MCP session and retrying"
+                )
+                await self._initialize_session()
+                return await self._call_tool(
+                    tool_name, arguments,
+                    progress_callback=progress_callback,
+                    status_callback=status_callback,
+                    _retried=True,
+                )
             resp.raise_for_status()
             result_data = None
             async for line in resp.aiter_lines():
@@ -300,7 +360,15 @@ class ForensicsClient:
 
         content = result_data.get("result", {}).get("content", [])
         if content and content[0].get("type") == "text":
-            return json.loads(content[0]["text"])
+            text = content[0]["text"]
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                # Tool returned non-JSON text (likely an error message)
+                is_error = result_data.get("result", {}).get("isError", False)
+                if is_error:
+                    raise RuntimeError(f"Tool error: {text}")
+                raise RuntimeError(f"Tool returned non-JSON text: {text!r}")
         raise RuntimeError(f"Unexpected MCP response structure: {result_data}")
 
     @staticmethod

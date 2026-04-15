@@ -26,6 +26,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -175,6 +176,11 @@ def _build_drive_service():
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if not creds_path:
         raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS not set")
+    return _build_drive_service_from_file(creds_path)
+
+
+def _build_drive_service_from_file(creds_path: str):
+    """Build a Google Drive API service from a service-account JSON file."""
     creds = service_account.Credentials.from_service_account_file(
         creds_path, scopes=DRIVE_SCOPES
     )
@@ -256,11 +262,15 @@ def _upload_to_s3(s3: Minio, bucket: str, key: str, data: bytes, content_type: s
 
 async def run_cache(
     status_callback=None,
+    poll_interval: float = 30.0,
 ) -> dict[str, int]:
     """
-    Download PDFs from Google Drive and send them to the MCP server for
-    processing, populating the server-side cache.  Does not upload to S3
-    or update sync state.
+    Submit a Drive sync job to the MCP server and poll until complete.
+
+    The server walks Drive, downloads PDFs, and processes them in the
+    background.  This function submits the job and polls for status,
+    so the client can be interrupted and restarted without losing
+    server-side progress.
     """
 
     async def _status(msg: str) -> None:
@@ -268,51 +278,68 @@ async def run_cache(
         if status_callback:
             await status_callback(msg)
 
+    # Read credentials file content to send to the server
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not creds_path:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS not set")
+    with open(creds_path) as f:
+        creds_json = f.read()
+
+    # Build folder list from env vars
     folder_ids = _get_folder_ids()
-    drive_service = _build_drive_service()
-    totals = {"cached": 0, "errors": 0}
+    folders = [
+        {"section": section, "folder_id": fid}
+        for section, fid in folder_ids.items()
+    ]
 
     async with ForensicsClient() as client:
-        for section, folder_id in folder_ids.items():
-            await _status(f"\nCaching {section} (folder {folder_id[:12]}...)...")
+        await _status(f"Submitting sync job ({len(folders)} folders)...")
+        result = await client.submit_sync_job(creds_json, folders)
 
-            drive_files = _list_pdfs_recursively(drive_service, folder_id)
-            await _status(f"  Found {len(drive_files)} PDFs in Drive")
+        if "error" in result:
+            if result["error"] == "busy":
+                job_id = result["active_job_id"]
+                await _status(f"A job is already running: {job_id} — polling it")
+            else:
+                raise RuntimeError(f"Submit error: {result['error']}")
+        else:
+            job_id = result["job_id"]
+            await _status(f"Job submitted: {job_id}")
 
-            for df in drive_files:
-                drive_path = df.get("_drive_path", df["name"])
-                try:
-                    await _status(f"  Processing {drive_path}...")
+        # Poll until done (REST endpoints — instant, no SSE)
+        while True:
+            await asyncio.sleep(poll_interval)
+            status = await client.get_job_status(job_id)
 
-                    pdf_bytes = _download_pdf(drive_service, df["id"])
-                    await _status(f"    Downloaded {len(pdf_bytes) / 1024:.1f} KB")
+            if "error" in status:
+                raise RuntimeError(f"Status error: {status['error']}")
 
-                    await _status("    Sending to MCP server...")
-                    result = await client.process_pdf_bytes(
-                        pdf_bytes,
-                        filename=df["name"],
-                        progress_callback=lambda done, total: logger.info(
-                            "    Page %d/%d", done, total
-                        ),
-                        status_callback=lambda m: logger.info("    %s", m),
-                    )
+            files_done = status.get("files_done", 0)
+            files_total = status.get("files_total", 0)
+            files_cached = status.get("files_cached", 0)
+            current = status.get("current_file", "")
+            progress = status.get("current_file_progress", "")
 
-                    totals["cached"] += 1
-                    await _status(
-                        f"    Done — {result.pages_processed} pages, "
-                        f"{result.images_transcribed} images transcribed"
-                    )
+            await _status(
+                f"  [{files_done}/{files_total}] "
+                f"cached={files_cached} "
+                f"errors={status.get('files_errors', 0)} "
+                f"| {current} ({progress})"
+            )
 
-                except Exception as exc:
-                    logger.exception("Error caching %s", drive_path)
-                    await _status(f"    ERROR: {exc}")
-                    totals["errors"] += 1
-
-    await _status(
-        f"\nCache complete: {totals['cached']} processed, "
-        f"{totals['errors']} errors"
-    )
-    return totals
+            if status["status"] == "completed":
+                await _status("Job completed!")
+                return {
+                    "cached": files_done,
+                    "errors": status.get("files_errors", 0),
+                }
+            elif status["status"] == "failed":
+                errors = status.get("errors", [])
+                await _status(f"Job failed: {errors}")
+                return {
+                    "cached": files_done,
+                    "errors": status.get("files_errors", 0),
+                }
 
 
 async def run_sync(
@@ -500,7 +527,9 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
     )
+    sys.stdout.reconfigure(line_buffering=True)
 
     full = "--full" in sys.argv
     dry_run = "--dry-run" in sys.argv

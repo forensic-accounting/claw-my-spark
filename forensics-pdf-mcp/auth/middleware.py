@@ -30,7 +30,7 @@ from .signing import verify_signature
 logger = logging.getLogger(__name__)
 
 EXEMPT_PATHS = {"/health", "/"}
-TIMESTAMP_WINDOW_SECONDS = 60
+TIMESTAMP_WINDOW_SECONDS = 120
 
 
 class ECDSAAuthMiddleware(BaseHTTPMiddleware):
@@ -49,6 +49,7 @@ class ECDSAAuthMiddleware(BaseHTTPMiddleware):
         signature_b64 = request.headers.get("X-Auth-Signature")
 
         if not all([key_id, timestamp, nonce, signature_b64]):
+            logger.warning("Auth rejected: missing headers (path=%s)", request.url.path)
             return JSONResponse(
                 {"detail": "Missing authentication headers"},
                 status_code=401,
@@ -59,20 +60,24 @@ class ECDSAAuthMiddleware(BaseHTTPMiddleware):
             ts = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             delta = abs((datetime.now(timezone.utc) - ts).total_seconds())
             if delta > TIMESTAMP_WINDOW_SECONDS:
+                logger.warning("Auth rejected: timestamp delta %.1fs (path=%s)", delta, request.url.path)
                 return JSONResponse(
                     {"detail": "Timestamp out of acceptable window"},
                     status_code=401,
                 )
         except (ValueError, AttributeError):
+            logger.warning("Auth rejected: invalid timestamp format (path=%s)", request.url.path)
             return JSONResponse({"detail": "Invalid timestamp format"}, status_code=401)
 
         # --- Look up public key ---
         public_key_pem = self._registry.get_active_key(key_id)
         if not public_key_pem:
+            logger.warning("Auth rejected: unknown key %s (path=%s)", key_id, request.url.path)
             return JSONResponse({"detail": "Unknown or inactive key"}, status_code=401)
 
         # --- Check nonce has not been used ---
         if self._registry.has_nonce(nonce):
+            logger.warning("Auth rejected: nonce replay (path=%s)", request.url.path)
             return JSONResponse({"detail": "Nonce already used"}, status_code=401)
 
         # --- Read and hash the body (Starlette caches this in request._body) ---
@@ -82,7 +87,7 @@ class ECDSAAuthMiddleware(BaseHTTPMiddleware):
         try:
             verify_signature(public_key_pem, key_id, timestamp, nonce, body, signature_b64)
         except (InvalidSignature, ValueError, Exception) as exc:
-            logger.debug("Signature verification failed for key %s: %s", key_id, exc)
+            logger.warning("Auth rejected: invalid signature for key %s: %s (path=%s)", key_id, exc, request.url.path)
             return JSONResponse({"detail": "Invalid signature"}, status_code=401)
 
         # --- Record nonce (also prunes old ones) ---

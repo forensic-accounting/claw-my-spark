@@ -16,12 +16,15 @@ Environment variables:
     HTTP_PORT         default 18790
 """
 
+import asyncio
 import base64
 import json
 import logging
 import os
 import pathlib
+import uuid
 
+import fastapi
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -29,11 +32,19 @@ from fastmcp import Context, FastMCP
 
 from auth.key_registry import KeyRegistry
 from auth.middleware import ECDSAAuthMiddleware
+from job_queue import JobQueue, JobBusyError
+from job_worker import run_job_worker
 from pdf_cache import PdfCache, slugify
 from pdf_processor import process_pdf_pipeline
 from drive_sync import run_sync, get_synced_documents, get_document_enriched_pdf
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=__import__("sys").stdout,
+)
+# Force stdout to flush immediately so docker logs shows output in real time
+__import__("sys").stdout.reconfigure(line_buffering=True)
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
@@ -54,6 +65,12 @@ registry.init_db()
 
 # --- PDF result cache ---
 cache = PdfCache(CACHE_DIR)
+
+# --- Job queue ---
+JOBS_DIR = os.getenv("JOBS_DIR", "/data/jobs")
+JOBS_DB = os.getenv("JOBS_DB", "/data/jobs.db")
+pathlib.Path(JOBS_DIR).mkdir(parents=True, exist_ok=True)
+job_queue = JobQueue(JOBS_DB)
 
 # --- FastMCP server ---
 mcp = FastMCP("forensics-pdf-mcp")
@@ -214,12 +231,109 @@ async def get_document_pdf(
     })
 
 
+@mcp.tool()
+async def submit_sync_job(
+    ctx: Context,
+    google_credentials_json: str,
+    folders: list[dict],
+) -> str:
+    """
+    Submit a Drive sync job for background processing.
+
+    The server walks the specified Google Drive folders, downloads each PDF,
+    and runs it through the forensic OCR pipeline.  Returns immediately with
+    a job_id that can be polled via ``get_job_status``.
+
+    Only one job may run at a time — submitting while one is active returns
+    an error with the active job's ID.
+
+    Args:
+        google_credentials_json: Service-account JSON string.
+        folders: List of {"section": "HOA", "folder_id": "..."} dicts.
+
+    Returns JSON: {"job_id": "...", "status": "pending"} or
+                  {"error": "busy", "active_job_id": "..."}.
+    """
+    job_id = str(uuid.uuid4())
+
+    # Write credentials to a temp file
+    creds_path = os.path.join(JOBS_DIR, f"{job_id}_creds.json")
+    pathlib.Path(creds_path).write_text(google_credentials_json)
+
+    try:
+        job = job_queue.submit(job_id, folders, creds_path)
+    except JobBusyError as exc:
+        # Clean up the creds file we just wrote
+        pathlib.Path(creds_path).unlink(missing_ok=True)
+        return json.dumps({
+            "error": "busy",
+            "active_job_id": exc.active_job_id,
+        })
+
+    await ctx.info(f"Job {job_id} submitted — {len(folders)} folders queued")
+    return json.dumps({"job_id": job_id, "status": job["status"]})
+
+
+@mcp.tool()
+async def get_job_status(
+    ctx: Context,
+    job_id: str,
+) -> str:
+    """
+    Poll the status of a sync job submitted via ``submit_sync_job``.
+
+    Args:
+        job_id: The job ID returned by submit_sync_job.
+
+    Returns JSON with: job_id, status, folders_total, folders_done,
+    files_total, files_done, files_cached, files_errors, current_file,
+    current_file_progress, errors, started_at, completed_at.
+    """
+    job = job_queue.get(job_id)
+    if job is None:
+        return json.dumps({"error": f"Job not found: {job_id}"})
+
+    # Don't expose the credentials path to the client
+    job.pop("creds_path", None)
+    return json.dumps(job)
+
+
 # --- FastAPI app ---
-# Capture the mcp ASGI app first so we can pass its lifespan to FastAPI.
+# Capture the mcp ASGI app first so we can compose its lifespan with ours.
 # FastMCP's StreamableHTTPSessionManager requires the lifespan to run its
 # internal task group; without it every request gets a 500.
 mcp_app = mcp.http_app(path="/")
-app = FastAPI(title="forensics-pdf-mcp", lifespan=mcp_app.lifespan)
+_mcp_lifespan = mcp_app.lifespan
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(app_instance):
+    """Compose FastMCP lifespan with the background job worker."""
+    worker_task = asyncio.create_task(
+        run_job_worker(
+            queue=job_queue,
+            cache=cache,
+            ollama_base_url=OLLAMA_BASE_URL,
+            vision_model=VISION_MODEL,
+            summary_model=SUMMARY_MODEL,
+            workspace_dir=WORKSPACE_DIR,
+        )
+    )
+    logger.info("Background job worker started")
+    async with _mcp_lifespan(app_instance):
+        yield
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("Background job worker stopped")
+
+
+app = FastAPI(title="forensics-pdf-mcp", lifespan=_lifespan)
 
 # Add auth middleware first (becomes outermost wrapper due to LIFO)
 app.add_middleware(ECDSAAuthMiddleware, registry=registry)
@@ -228,6 +342,40 @@ app.add_middleware(ECDSAAuthMiddleware, registry=registry)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# --- REST endpoints for job queue (no MCP/SSE overhead) ---
+
+@app.post("/jobs/submit")
+async def rest_submit_job(request: fastapi.Request):
+    """Submit a Drive sync job. Returns immediately with job_id."""
+    body = await request.json()
+    google_credentials_json = body.get("google_credentials_json", "")
+    folders = body.get("folders", [])
+    if not google_credentials_json or not folders:
+        return JSONResponse(
+            {"error": "google_credentials_json and folders are required"},
+            status_code=400,
+        )
+    job_id = str(uuid.uuid4())
+    creds_path = os.path.join(JOBS_DIR, f"{job_id}_creds.json")
+    pathlib.Path(creds_path).write_text(google_credentials_json)
+    try:
+        job = job_queue.submit(job_id, folders, creds_path)
+    except JobBusyError as exc:
+        pathlib.Path(creds_path).unlink(missing_ok=True)
+        return JSONResponse({"error": "busy", "active_job_id": exc.active_job_id})
+    return {"job_id": job_id, "status": job["status"]}
+
+
+@app.get("/jobs/{job_id}")
+async def rest_job_status(job_id: str):
+    """Poll job status. Instant JSON response."""
+    job = job_queue.get(job_id)
+    if job is None:
+        return JSONResponse({"error": f"Job not found: {job_id}"}, status_code=404)
+    job.pop("creds_path", None)
+    return job
 
 
 # Mount FastMCP at /mcp — must happen after middleware is registered
